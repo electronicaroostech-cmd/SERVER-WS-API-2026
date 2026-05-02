@@ -1,37 +1,44 @@
 const express = require("express");
+const axios = require("axios"); // Importante para enviar la respuesta
 const app = express();
 app.use(express.json());
 
 const VERIFY_TOKEN = "ANYELVER_PRO_2026";
+const ACCESS_TOKEN = "EAALodUAV6RgBRSCGGUk1w6B0OZCZA2QSmhevoTixLVaQROcCLjw3FdTRk53QMFJcVrxZBCQKKj2lGgZC6fkbiEEFcGbeOMFlqVsJ3JK40A5eBoPnAOvpcZB09UZAaIUnXCzlEgFWhN9A1DJjSfZAsi50AgwVOzOmYi43EVXZBqzCX7Vz69LS5lyBYn1F26TpZAPnunAw7WqBw2u40YGyvpp6o6q5KAoEV4VpTBN0mbadhxrTtDPjDGlQxtdMYvlbg5J9qjDaaYMWghXEuEzTtIOGZAp2Dc"; // El que dura 24h
+const PHONE_NUMBER_ID = "1066218519907665";
 
-// Ruta raíz para confirmar que el servidor vive
-app.get("/", (req, res) => {
-  res.send("Servidor de Anyelver activo y listo");
-});
+app.post("/webhook", async (req, res) => {
+  const entry = req.body.entry?.[0];
+  const changes = entry?.changes?.[0];
+  const message = changes?.value?.messages?.[0];
 
-// Ruta de validación mejorada
-app.get("/webhook", (req, res) => {
-  console.log("--- INTENTO DE VALIDACIÓN RECIBIDO ---");
-  console.log("Query Params:", req.query);
+  if (message) {
+    const from = message.from; // El número que te escribió
+    const msgText = message.text?.body; // Lo que te escribió
 
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
+    console.log(`Respondiendo a ${from}...`);
 
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("¡VALIDACIÓN EXITOSA!");
-    return res.status(200).send(challenge);
+    try {
+      // Petición a la API de Graph de Meta
+      await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
+        messaging_product: "whatsapp",
+        to: from,
+        type: "text",
+        text: { body: `Ingeniero Anyelver, recibí tu mensaje: "${msgText}". El servidor está funcionando al 100%.` }
+      }, {
+        headers: { 
+          'Authorization': `Bearer ${ACCESS_TOKEN}`,
+          'Content-Type': 'application/json' 
+        }
+      });
+      console.log("Respuesta enviada con éxito");
+    } catch (error) {
+      console.error("Error al enviar respuesta:", error.response?.data || error.message);
+    }
   }
 
-  console.log("Fallo en la validación: Token o modo incorrecto");
-  res.sendStatus(403);
+  res.sendStatus(200); // Siempre responde 200 a Meta para evitar reintentos
 });
 
-app.post("/webhook", (req, res) => {
-  console.log("--- MENSAJE RECIBIDO ---");
-  console.log(JSON.stringify(req.body, null, 2));
-  res.sendStatus(200);
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor corriendo en puerto ${PORT}`));
+// Mantén tus rutas GET / y GET /webhook como están
+app.listen(process.env.PORT || 3000, () => console.log("Servidor listo"));
