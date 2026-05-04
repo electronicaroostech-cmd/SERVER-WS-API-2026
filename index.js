@@ -63,7 +63,8 @@ function normalizeSearchTerms(userQuery) {
   const stopWords = new Set([
     "hola", "buenas", "tienen", "tienes", "hay", "me", "puedes", "puede", "quiero",
     "necesito", "busco", "el", "la", "los", "las", "de", "del", "para", "con", "y",
-    "por", "favor", "precio", "cuesta", "cuanto", "disponible", "stock", "un", "una"
+    "por", "favor", "precio", "cuesta", "cuanto", "disponible", "stock"
+    // NOTA: NO incluir "un", "una", "uno" porque son parte de nombres de productos (Arduino UNO, etc.)
   ]);
 
   const words = clean.split(" ").filter((word) => word.length >= 3 && !stopWords.has(word));
@@ -306,16 +307,17 @@ function buildRoosbotPrompt(userMessage, products) {
     "- NO digas 'Hola' ni saludos en cada mensaje.",
     "- NO hagas preguntas sobre el proyecto del cliente si ya pidio un producto especifico.",
     "- NO inventes precios, stock ni links. Solo usa los datos del catalogo.",
-    "- Respuesta maxima: 5 lineas.",
+    "- Tu respuesta es SOLO la introduccion: maximo 1 sola frase corta.",
+    "- NO listes productos, NO incluyas precios, NO incluyas links. Los productos se muestran aparte automaticamente.",
     "",
     instruccionProductos,
     "",
-    "Catalogo disponible:",
+    "Catalogo disponible (solo para contexto, NO lo repitas en tu respuesta):",
     productsBlock,
     "",
     `Mensaje del cliente: ${userMessage}`,
     "",
-    "Responde ya, sin preambulos:",
+    "Escribe UNA sola frase de introduccion (ejemplo: 'Tenemos esto para ti:' o 'No tenemos ese exacto, pero mira estas opciones:'):",
   ].join("\n");
 }
 
