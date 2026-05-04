@@ -319,6 +319,80 @@ function buildRoosbotPrompt(userMessage, products) {
   ].join("\n");
 }
 
+// --- ENVÍO DE MENSAJES WHATSAPP ---
+
+async function sendTextMessage(to, text) {
+  await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
+    messaging_product: "whatsapp",
+    to,
+    type: "text",
+    text: { body: text, preview_url: false }
+  }, {
+    headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" }
+  });
+}
+
+async function sendInteractiveButtons(to, bodyText, buttons) {
+  // WhatsApp: max 3 botones, titulo max 20 chars
+  const safeButtons = buttons.slice(0, 3).map((btn) => ({
+    type: "reply",
+    reply: {
+      id: btn.id,
+      title: btn.title.slice(0, 20)
+    }
+  }));
+
+  await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
+    messaging_product: "whatsapp",
+    to,
+    type: "interactive",
+    interactive: {
+      type: "button",
+      body: { text: bodyText },
+      action: { buttons: safeButtons }
+    }
+  }, {
+    headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" }
+  });
+}
+
+async function sendProductsResponse(to, products, aiIntro) {
+  if (!products.length) {
+    return await sendTextMessage(to, aiIntro);
+  }
+
+  // Formato profesional del cuerpo
+  const productLines = products.slice(0, MAX_OPTIONS).map((p, i) => {
+    const precio = p.price ? `$${p.price}` : "Precio N/D";
+    return `*${i + 1}. ${p.name}*\n💰 ${precio} ${p.currency || ""}\n🔗 ${p.url || ""}`;
+  }).join("\n\n");
+
+  const bodyText = `${aiIntro}\n\n${productLines}`;
+
+  // Botones según cantidad de productos
+  const buttons = [];
+  if (products[0]) buttons.push({ id: "agregar_1", title: `Agregar opción 1` });
+  if (products[1]) buttons.push({ id: "agregar_2", title: `Agregar opción 2` });
+  if (products[2]) buttons.push({ id: "agregar_3", title: `Agregar opción 3` });
+
+  // Si solo hay 1 producto, botones más naturales
+  if (products.length === 1) {
+    buttons.length = 0;
+    buttons.push({ id: "agregar_1", title: "Apartar este" });
+    buttons.push({ id: "buscar_otro", title: "Buscar otro" });
+    buttons.push({ id: "ver_lista", title: "Ver mi lista" });
+  } else {
+    buttons.push({ id: "ver_lista", title: "Ver mi lista" });
+  }
+
+  try {
+    await sendInteractiveButtons(to, bodyText.slice(0, 1024), buttons);
+  } catch {
+    // Fallback a texto plano si el interactive falla (ej. número no registrado en WA Business)
+    await sendTextMessage(to, bodyText + "\n\nEscribe *agregar 1*, *agregar 2* o *ver lista*.");
+  }
+}
+
 app.get("/", (req, res) => {
   res.status(200).send("API de Roostech activa en Render.");
 });
@@ -359,19 +433,41 @@ app.post("/webhook", async (req, res) => {
 
   if (message) {
     const from = message.from;
-    const msgText = message.text?.body;
     const state = getUserState(from);
+
+    // Detectar si es clic de botón interactivo
+    const buttonReplyId = message.interactive?.button_reply?.id;
+    const msgText = buttonReplyId || message.text?.body || "";
 
     console.log(`Mensaje de ${from}: ${msgText}`);
 
     try {
-      let aiResponse;
+      // Manejar clics de botones nativos
+      if (buttonReplyId) {
+        if (buttonReplyId === "ver_lista") {
+          await sendTextMessage(from, handleListIntent(state));
+        } else if (buttonReplyId === "buscar_otro") {
+          await sendTextMessage(from, "Claro, dime que producto necesitas.");
+        } else if (buttonReplyId.startsWith("agregar_")) {
+          const index = Number(buttonReplyId.replace("agregar_", "")) - 1;
+          const selected = state.lastOptions[index];
+          if (selected) {
+            state.cart.push({ id: selected.id, name: selected.name, price: selected.price, currency: selected.currency, url: selected.url });
+            const cartPreview = state.cart.map((item, i) => `${i + 1}. ${item.name} — $${item.price || "N/D"} ${item.currency || ""}`).join("\n");
+            await sendTextMessage(from, `✅ *${selected.name}* apartado.\n\n*Tu lista:*\n${cartPreview}\n\nEscribe el nombre de otro producto o *ver lista* para ver todo.`);
+          } else {
+            await sendTextMessage(from, "No encontre esa opcion. Dime el producto que quieres y te lo busco.");
+          }
+        }
+        return res.sendStatus(200);
+      }
 
-      const addReply = handleAddToCartIntent(msgText || "", state);
+      // Flujo normal por texto
+      const addReply = handleAddToCartIntent(msgText, state);
       if (addReply) {
-        aiResponse = addReply;
-      } else if (isListIntent(msgText || "")) {
-        aiResponse = handleListIntent(state);
+        await sendTextMessage(from, addReply);
+      } else if (isListIntent(msgText)) {
+        await sendTextMessage(from, handleListIntent(state));
       } else {
         const products = await fetchWooProducts(msgText);
         console.log(`WooCommerce devolvio ${products.length} producto(s) para: "${msgText}"`);
@@ -379,28 +475,18 @@ app.post("/webhook", async (req, res) => {
           console.log("Productos:", products.map((p) => p.name).join(" | "));
         }
         state.lastOptions = products.slice(0, MAX_OPTIONS);
-        state.lastQuery = msgText || "";
+        state.lastQuery = msgText;
 
-        const prompt = buildRoosbotPrompt(msgText || "", products);
-        aiResponse = await generateAiText(prompt);
+        const prompt = buildRoosbotPrompt(msgText, products);
+        const aiIntro = await generateAiText(prompt);
+        await sendProductsResponse(from, state.lastOptions, aiIntro);
       }
 
-      await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
-        messaging_product: "whatsapp",
-        to: from,
-        type: "text",
-        text: { body: aiResponse }
-      }, {
-        headers: {
-          Authorization: `Bearer ${ACCESS_TOKEN}`,
-          "Content-Type": "application/json"
-        }
-      });
       console.log("Respuesta enviada con exito");
     } catch (error) {
       const errData = error.response?.data;
       if (errData?.error?.code === 190) {
-        console.error("TOKEN WHATSAPP EXPIRADO. Ve a Meta Developers, genera un nuevo ACCESS_TOKEN y actualiza la variable en Render.");
+        console.error("TOKEN WHATSAPP EXPIRADO. Actualiza ACCESS_TOKEN en Render.");
       } else {
         console.error("Error al enviar:", errData || error.message);
       }
