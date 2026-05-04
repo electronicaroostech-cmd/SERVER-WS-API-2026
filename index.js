@@ -71,6 +71,7 @@ function mapWooProduct(product) {
     sku: product.sku,
     price: product.price,
     currency: product.currency,
+    imageUrl: product.images?.[0]?.src || null,
     shortDescription: (product.short_description || "")
       .replace(/<[^>]*>/g, " ")
       .replace(/\s+/g, " ")
@@ -479,7 +480,7 @@ async function sendTextMessage(to, text) {
   });
 }
 
-async function sendInteractiveButtons(to, bodyText, buttons) {
+async function sendInteractiveButtons(to, bodyText, buttons, imageUrl = null) {
   // WhatsApp: max 3 botones, titulo max 20 chars
   const safeButtons = buttons.slice(0, 3).map((btn) => ({
     type: "reply",
@@ -489,15 +490,24 @@ async function sendInteractiveButtons(to, bodyText, buttons) {
     }
   }));
 
+  const interactivePayload = {
+    type: "button",
+    body: { text: bodyText },
+    action: { buttons: safeButtons }
+  };
+
+  if (imageUrl) {
+    interactivePayload.header = {
+      type: "image",
+      image: { link: imageUrl }
+    };
+  }
+
   await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
     messaging_product: "whatsapp",
     to,
     type: "interactive",
-    interactive: {
-      type: "button",
-      body: { text: bodyText },
-      action: { buttons: safeButtons }
-    }
+    interactive: interactivePayload
   }, {
     headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" }
   });
@@ -507,6 +517,8 @@ async function sendProductsResponse(to, products, aiIntro) {
   if (!products.length) {
     return await sendTextMessage(to, aiIntro);
   }
+
+  const topImageUrl = products[0]?.imageUrl;
 
   // Formato profesional del cuerpo
   const productLines = products.slice(0, MAX_OPTIONS).map((p, i) => {
@@ -533,7 +545,7 @@ async function sendProductsResponse(to, products, aiIntro) {
   }
 
   try {
-    await sendInteractiveButtons(to, bodyText.slice(0, 1024), buttons);
+    await sendInteractiveButtons(to, bodyText.slice(0, 1024), buttons, topImageUrl);
   } catch {
     // Fallback a texto plano si el interactive falla (ej. número no registrado en WA Business)
     await sendTextMessage(to, bodyText + "\n\nEscribe *agregar 1*, *agregar 2* o *ver lista*.");
