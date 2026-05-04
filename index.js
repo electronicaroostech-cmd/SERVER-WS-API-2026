@@ -3,9 +3,9 @@ const axios = require("axios"); // Importante para enviar la respuesta
 const app = express();
 app.use(express.json());
 
-const VERIFY_TOKEN = "ANYELVER_PRO_2026";
-const ACCESS_TOKEN = "EAALodUAV6RgBRSCGGUk1w6B0OZCZA2QSmhevoTixLVaQROcCLjw3FdTRk53QMFJcVrxZBCQKKj2lGgZC6fkbiEEFcGbeOMFlqVsJ3JK40A5eBoPnAOvpcZB09UZAaIUnXCzlEgFWhN9A1DJjSfZAsi50AgwVOzOmYi43EVXZBqzCX7Vz69LS5lyBYn1F26TpZAPnunAw7WqBw2u40YGyvpp6o6q5KAoEV4VpTBN0mbadhxrTtDPjDGlQxtdMYvlbg5J9qjDaaYMWghXEuEzTtIOGZAp2Dc"; // El que dura 24h
-const PHONE_NUMBER_ID = "1066218519907665";
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
 app.post("/webhook", async (req, res) => {
   const entry = req.body.entry?.[0];
