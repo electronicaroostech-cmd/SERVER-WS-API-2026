@@ -18,7 +18,6 @@ const MAX_OPTIONS = Number(process.env.ROOSBOT_MAX_OPTIONS || 3);
 const WC_TIMEOUT_MS = Number(process.env.WC_TIMEOUT_MS || 6000);
 const SEARCH_CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS || 60000);
 const ENABLE_GEMINI_INTRO = process.env.ENABLE_GEMINI_INTRO === "true";
-const SEND_ALL_PRODUCT_IMAGES = process.env.SEND_ALL_PRODUCT_IMAGES === "true";
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const userState = new Map();
@@ -519,33 +518,7 @@ async function sendTextMessage(to, text) {
   });
 }
 
-async function sendImageMessage(to, imageUrl, caption = "") {
-  if (!imageUrl) {
-    return;
-  }
-
-  await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
-    messaging_product: "whatsapp",
-    to,
-    type: "image",
-    image: {
-      link: imageUrl,
-      caption: caption.slice(0, 1024)
-    }
-  }, {
-    headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" }
-  });
-}
-
-async function sendProductImagesGallery(to, products) {
-  const gallery = products.slice(0, MAX_OPTIONS).filter((p) => p.imageUrl);
-  for (let i = 0; i < gallery.length; i += 1) {
-    const p = gallery[i];
-    await sendImageMessage(to, p.imageUrl, `Opcion ${i + 1}: ${p.name}`);
-  }
-}
-
-async function sendInteractiveButtons(to, bodyText, buttons, imageUrl = null) {
+async function sendInteractiveButtons(to, bodyText, buttons) {
   // WhatsApp: max 3 botones, titulo max 20 chars
   const safeButtons = buttons.slice(0, 3).map((btn) => ({
     type: "reply",
@@ -561,13 +534,6 @@ async function sendInteractiveButtons(to, bodyText, buttons, imageUrl = null) {
     action: { buttons: safeButtons }
   };
 
-  if (imageUrl) {
-    interactivePayload.header = {
-      type: "image",
-      image: { link: imageUrl }
-    };
-  }
-
   await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
     messaging_product: "whatsapp",
     to,
@@ -582,8 +548,6 @@ async function sendProductsResponse(to, products, aiIntro) {
   if (!products.length) {
     return await sendTextMessage(to, aiIntro);
   }
-
-  const topImageUrl = products[0]?.imageUrl;
 
   // Formato profesional del cuerpo
   const productLines = products.slice(0, MAX_OPTIONS).map((p, i) => {
@@ -610,12 +574,7 @@ async function sendProductsResponse(to, products, aiIntro) {
   }
 
   try {
-    if (SEND_ALL_PRODUCT_IMAGES) {
-      await sendProductImagesGallery(to, products);
-      await sendInteractiveButtons(to, bodyText.slice(0, 1024), buttons, null);
-    } else {
-      await sendInteractiveButtons(to, bodyText.slice(0, 1024), buttons, topImageUrl);
-    }
+    await sendInteractiveButtons(to, bodyText.slice(0, 1024), buttons);
   } catch {
     // Fallback a texto plano si el interactive falla (ej. número no registrado en WA Business)
     await sendTextMessage(to, bodyText + "\n\nEscribe *agregar 1*, *agregar 2* o *ver lista*.");
