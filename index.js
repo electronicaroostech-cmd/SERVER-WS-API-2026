@@ -1,11 +1,16 @@
 const express = require("express");
 const axios = require("axios");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 const app = express();
 app.use(express.json());
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-lite-preview-06-17" });
 
 // 1. RUTA DE INICIO (Para que no salga "Cannot GET /")
 app.get("/", (req, res) => {
@@ -40,11 +45,15 @@ app.post("/webhook", async (req, res) => {
     console.log(`📩 Mensaje de ${from}: ${msgText}`);
 
     try {
+      // Generar respuesta con Gemini 2.5 Flash Lite
+      const result = await model.generateContent(msgText);
+      const aiResponse = result.response.text();
+
       await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
         messaging_product: "whatsapp",
         to: from,
         type: "text",
-        text: { body: `Ingeniero Anyelver, recibí tu mensaje: "${msgText}". El servidor está funcionando al 100%.` }
+        text: { body: aiResponse }
       }, {
         headers: { 
           'Authorization': `Bearer ${ACCESS_TOKEN}`,
