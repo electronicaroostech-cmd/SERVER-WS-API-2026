@@ -518,6 +518,30 @@ async function sendTextMessage(to, text) {
   });
 }
 
+async function sendInteractiveList(to, bodyText, products) {
+  const rows = products.slice(0, 10).map((p, i) => ({
+    id: `select_${i + 1}`,
+    title: p.name.substring(0, 24),
+    description: (p.price ? `$${p.price} ${p.currency || ""}`.trim() : "Ver más").substring(0, 72)
+  }));
+
+  await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
+    messaging_product: "whatsapp",
+    to,
+    type: "interactive",
+    interactive: {
+      type: "list",
+      body: { text: bodyText.substring(0, 1024) },
+      action: {
+        button: "Ver Catálogo",
+        sections: [{ title: "Productos disponibles", rows }]
+      }
+    }
+  }, {
+    headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" }
+  });
+}
+
 async function sendInteractiveButtons(to, bodyText, buttons) {
   // WhatsApp: max 3 botones, titulo max 20 chars
   const safeButtons = buttons.slice(0, 3).map((btn) => ({
@@ -549,35 +573,15 @@ async function sendProductsResponse(to, products, aiIntro) {
     return await sendTextMessage(to, aiIntro);
   }
 
-  // Formato profesional del cuerpo
-  const productLines = products.slice(0, MAX_OPTIONS).map((p, i) => {
-    const precio = p.price ? `$${p.price}` : "Precio N/D";
-    return `*${i + 1}. ${p.name}*\n💰 ${precio} ${p.currency || ""}\n🔗 ${p.url || ""}`;
-  }).join("\n\n");
-
-  const bodyText = `${aiIntro}\n\n${productLines}`;
-
-  // Botones según cantidad de productos
-  const buttons = [];
-  if (products[0]) buttons.push({ id: "agregar_1", title: `Agregar opción 1` });
-  if (products[1]) buttons.push({ id: "agregar_2", title: `Agregar opción 2` });
-  if (products[2]) buttons.push({ id: "agregar_3", title: `Agregar opción 3` });
-
-  // Si solo hay 1 producto, botones más naturales
-  if (products.length === 1) {
-    buttons.length = 0;
-    buttons.push({ id: "agregar_1", title: "Apartar este" });
-    buttons.push({ id: "buscar_otro", title: "Buscar otro" });
-    buttons.push({ id: "ver_lista", title: "Ver mi lista" });
-  } else {
-    buttons.push({ id: "ver_lista", title: "Ver mi lista" });
-  }
-
   try {
-    await sendInteractiveButtons(to, bodyText.slice(0, 1024), buttons);
-  } catch {
-    // Fallback a texto plano si el interactive falla (ej. número no registrado en WA Business)
-    await sendTextMessage(to, bodyText + "\n\nEscribe *agregar 1*, *agregar 2* o *ver lista*.");
+    await sendInteractiveList(to, aiIntro, products);
+  } catch (err) {
+    console.error("sendInteractiveList fallo:", JSON.stringify(err.response?.data ?? err.message, null, 2));
+    // Fallback a texto plano
+    const fallback = products.slice(0, MAX_OPTIONS)
+      .map((p, i) => `${i + 1}. *${p.name}* — ${p.price ? `$${p.price}` : "N/D"} ${p.currency || ""}\n${p.url || ""}`)
+      .join("\n\n");
+    await sendTextMessage(to, `${aiIntro}\n\n${fallback}\n\nEscribe *agregar 1*, *agregar 2* o *ver lista*.`);
   }
 }
 
@@ -623,21 +627,22 @@ app.post("/webhook", async (req, res) => {
     const from = message.from;
     const state = getUserState(from);
 
-    // Detectar si es clic de botón interactivo
-    const buttonReplyId = message.interactive?.button_reply?.id;
+    // Detectar si es clic de botón o selección de lista
+    const buttonReplyId = message.interactive?.button_reply?.id
+      || message.interactive?.list_reply?.id;
     const msgText = buttonReplyId || message.text?.body || "";
 
     console.log(`Mensaje de ${from}: ${msgText}`);
 
     try {
-      // Manejar clics de botones nativos
+      // Manejar clics de botones nativos y selecciones de lista
       if (buttonReplyId) {
         if (buttonReplyId === "ver_lista") {
           await sendTextMessage(from, handleListIntent(state));
         } else if (buttonReplyId === "buscar_otro") {
           await sendTextMessage(from, "Claro, dime que producto necesitas.");
-        } else if (buttonReplyId.startsWith("agregar_")) {
-          const index = Number(buttonReplyId.replace("agregar_", "")) - 1;
+        } else if (buttonReplyId.startsWith("agregar_") || buttonReplyId.startsWith("select_")) {
+          const index = Number(buttonReplyId.replace("agregar_", "").replace("select_", "")) - 1;
           const selected = state.lastOptions[index];
           if (selected) {
             state.cart.push({ id: selected.id, name: selected.name, price: selected.price, currency: selected.currency, url: selected.url });
