@@ -398,7 +398,12 @@ app.post("/webhook", async (req, res) => {
       });
       console.log("Respuesta enviada con exito");
     } catch (error) {
-      console.error("Error al enviar:", error.response?.data || error.message);
+      const errData = error.response?.data;
+      if (errData?.error?.code === 190) {
+        console.error("TOKEN WHATSAPP EXPIRADO. Ve a Meta Developers, genera un nuevo ACCESS_TOKEN y actualiza la variable en Render.");
+      } else {
+        console.error("Error al enviar:", errData || error.message);
+      }
     }
   }
 
