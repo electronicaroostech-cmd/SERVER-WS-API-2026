@@ -273,38 +273,69 @@ function handleListIntent(state) {
 
 function buildRoosbotPrompt(userMessage, products) {
   const topProducts = products.slice(0, MAX_OPTIONS);
-  const productsBlock = topProducts.length
+  const hayProductos = topProducts.length > 0;
+
+  const productsBlock = hayProductos
     ? topProducts
         .map(
           (product, index) =>
-            `${index + 1}. ${product.name} | Precio: ${product.price || "N/D"} ${product.currency || ""} | Stock: ${product.stockStatus || "N/D"} | Categorias: ${product.categories || "N/D"} | Link: ${product.url || "N/D"} | Descripcion: ${product.shortDescription || "N/D"}`
+            `${index + 1}. ${product.name} | Precio: ${product.price || "N/D"} ${product.currency || ""} | Stock: ${product.stockStatus || "N/D"} | Link: ${product.url || "N/D"}`
         )
         .join("\n")
-    : "No hay productos coincidentes en este momento o WooCommerce no esta configurado.";
+    : "CATALOGO VACIO: no se encontraron productos para esta consulta.";
+
+  const instruccionProductos = hayProductos
+    ? [
+        "HAY PRODUCTOS DISPONIBLES. DEBES mostrarlos directamente.",
+        "Formato obligatorio:",
+        "- Una linea por producto: nombre, precio y link.",
+        "- Maximo 2 lineas de texto tuyo (no preguntes el proyecto, no pidas mas datos).",
+        "- Si el cliente pide uno especifico y esta en el catalogo, muestra ese primero.",
+        "- Puedes cerrar con UNA frase de ayuda como 'Escribe *agregar 1* para apartar'.",
+      ].join("\n")
+    : [
+        "NO hay productos que coincidan exactamente.",
+        "Di claramente que no tenemos ese producto.",
+        "Si el catalogo tiene productos relacionados, menciona 1 o 2 como alternativa real.",
+        "No preguntes el proyecto. No inventes productos.",
+      ].join("\n");
 
   return [
-    `Eres ${ROOSBOT_NAME}, asistente comercial de Roostech por WhatsApp.`,
-    "Responde en espanol natural, cercano y profesional, como una persona real.",
-    "Objetivo: atender consultas, recomendar lo mejor segun necesidad y cerrar venta sin sonar robotico.",
-    "Reglas:",
-    "- Respuesta corta: 2 a 5 lineas.",
-    "- Si recomiendas productos, menciona 1 a 3 opciones maximo.",
-    "- Estructura sugerida: saludo breve, opciones con beneficio corto, pregunta de cierre.",
-    "- Si falta informacion, haz una pregunta breve para afinar recomendacion.",
-    "- No inventes precios, stock ni enlaces. Usa solo la data disponible.",
-    "- Si no hay productos para esa consulta, dilo con honestidad y ofrece alternativa.",
+    `Eres ${ROOSBOT_NAME}, vendedor de Roostech en WhatsApp. Responde como persona real, directo y sin rodeos.`,
+    "REGLAS ABSOLUTAS:",
+    "- NO digas 'Hola' ni saludos en cada mensaje.",
+    "- NO hagas preguntas sobre el proyecto del cliente si ya pidio un producto especifico.",
+    "- NO inventes precios, stock ni links. Solo usa los datos del catalogo.",
+    "- Respuesta maxima: 5 lineas.",
     "",
-    "Catalogo WooCommerce disponible:",
+    instruccionProductos,
+    "",
+    "Catalogo disponible:",
     productsBlock,
     "",
-    `Consulta del cliente: ${userMessage}`,
+    `Mensaje del cliente: ${userMessage}`,
     "",
-    "Genera una unica respuesta final lista para enviar por WhatsApp.",
+    "Responde ya, sin preambulos:",
   ].join("\n");
 }
 
 app.get("/", (req, res) => {
   res.status(200).send("API de Roostech activa en Render.");
+});
+
+// Endpoint de diagnostico: muestra que devuelve WooCommerce para un termino
+app.get("/debug-products", async (req, res) => {
+  const query = req.query.q || "";
+  if (!hasWooCredentials()) {
+    return res.status(500).json({ error: "WooCommerce no configurado" });
+  }
+  try {
+    const baseUrl = WC_BASE_URL.replace(/\/$/, "");
+    const products = await queryWooProducts(baseUrl, query);
+    res.json({ query, total: products.length, products });
+  } catch (error) {
+    res.status(500).json({ error: error.message, details: error.response?.data });
+  }
 });
 
 app.get("/webhook", (req, res) => {
@@ -343,6 +374,10 @@ app.post("/webhook", async (req, res) => {
         aiResponse = handleListIntent(state);
       } else {
         const products = await fetchWooProducts(msgText);
+        console.log(`WooCommerce devolvio ${products.length} producto(s) para: "${msgText}"`);
+        if (products.length) {
+          console.log("Productos:", products.map((p) => p.name).join(" | "));
+        }
         state.lastOptions = products.slice(0, MAX_OPTIONS);
         state.lastQuery = msgText || "";
 
