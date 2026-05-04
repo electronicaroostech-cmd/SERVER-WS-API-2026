@@ -14,8 +14,10 @@ const WC_CONSUMER_KEY = process.env.WC_CONSUMER_KEY;
 const WC_CONSUMER_SECRET = process.env.WC_CONSUMER_SECRET;
 const ROOSBOT_NAME = process.env.ROOSBOT_NAME || "ROOSbot";
 const WC_SEARCH_LIMIT = Number(process.env.WC_SEARCH_LIMIT || 8);
+const MAX_OPTIONS = Number(process.env.ROOSBOT_MAX_OPTIONS || 3);
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const userState = new Map();
 
 async function generateAiText(prompt) {
   const candidateModels = [GEMINI_MODEL, "gemini-2.5-flash-lite", "gemini-2.5-flash"];
@@ -61,7 +63,7 @@ function normalizeSearchTerms(userQuery) {
   const stopWords = new Set([
     "hola", "buenas", "tienen", "tienes", "hay", "me", "puedes", "puede", "quiero",
     "necesito", "busco", "el", "la", "los", "las", "de", "del", "para", "con", "y",
-    "por", "favor", "precio", "cuesta", "cuanto", "cuanto", "disponible", "stock", "un", "una"
+    "por", "favor", "precio", "cuesta", "cuanto", "disponible", "stock", "un", "una"
   ]);
 
   const words = clean.split(" ").filter((word) => word.length >= 3 && !stopWords.has(word));
@@ -82,7 +84,9 @@ function normalizeSearchTerms(userQuery) {
 
 function mapWooProduct(product) {
   return {
+    id: product.id,
     name: product.name,
+    sku: product.sku,
     price: product.price,
     currency: product.currency,
     shortDescription: (product.short_description || "")
@@ -131,7 +135,6 @@ async function fetchWooProducts(userQuery) {
       }
     }
 
-    // Fallback: si no hubo match por texto, devuelve catalogo reciente para recomendar alternativas reales.
     return await queryWooProducts(baseUrl, "");
   } catch (error) {
     console.error("Error consultando WooCommerce:", error.response?.status, error.response?.data || error.message);
@@ -139,9 +142,139 @@ async function fetchWooProducts(userQuery) {
   }
 }
 
+function initialUserState() {
+  return {
+    lastOptions: [],
+    cart: [],
+    lastQuery: "",
+  };
+}
+
+function getUserState(phone) {
+  if (!userState.has(phone)) {
+    userState.set(phone, initialUserState());
+  }
+  return userState.get(phone);
+}
+
+function extractSelectionIndex(text) {
+  if (!text) {
+    return null;
+  }
+
+  const match = text.match(/\b([1-9])\b/);
+  if (!match) {
+    return null;
+  }
+
+  return Number(match[1]) - 1;
+}
+
+function isAddIntent(text) {
+  if (!text) {
+    return false;
+  }
+
+  const normalized = text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+  return /\b(agrega|agregar|anade|anadir|sumar|llevar|me\s+llevo|apartar|reservar)\b/.test(normalized);
+}
+
+function resolveProductFromSelection(text, options) {
+  if (!options?.length) {
+    return null;
+  }
+
+  const byIndex = extractSelectionIndex(text);
+  if (byIndex !== null && options[byIndex]) {
+    return options[byIndex];
+  }
+
+  const normalized = (text || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+  return options.find((product) => {
+    const productName = (product.name || "")
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "");
+    return productName && normalized.includes(productName);
+  }) || null;
+}
+
+function handleAddToCartIntent(userMessage, state) {
+  if (!isAddIntent(userMessage)) {
+    return null;
+  }
+
+  if (!state.lastOptions.length) {
+    return "Perfecto, te ayudo con eso. Primero dime que producto quieres y te paso opciones para agregar.";
+  }
+
+  const selected = resolveProductFromSelection(userMessage, state.lastOptions);
+  if (!selected) {
+    return "Listo. Dime cual deseas agregar: 1, 2 o 3 segun la ultima recomendacion, o escribe el nombre del producto.";
+  }
+
+  state.cart.push({
+    id: selected.id,
+    name: selected.name,
+    price: selected.price,
+    currency: selected.currency,
+    url: selected.url,
+  });
+
+  const cartPreview = state.cart
+    .slice(-3)
+    .map((item, index) => `${index + 1}. ${item.name} (${item.price || "N/D"} ${item.currency || ""})`)
+    .join("\n");
+
+  return [
+    `Listo, agregue ${selected.name} a tu lista.`,
+    "Tu lista actual:",
+    cartPreview,
+    "Si quieres, te ayudo a agregar otro o te paso el enlace directo para comprar.",
+  ].join("\n");
+}
+
+function isListIntent(text) {
+  if (!text) {
+    return false;
+  }
+
+  const normalized = text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+  return /\b(lista|carrito|agregados|que\s+agregue|que\s+tengo)\b/.test(normalized);
+}
+
+function handleListIntent(state) {
+  if (!state.cart.length) {
+    return "Aun no tienes productos agregados. Si quieres, te recomiendo opciones segun tu proyecto.";
+  }
+
+  const lines = state.cart
+    .map((item, index) => `${index + 1}. ${item.name} - ${item.price || "N/D"} ${item.currency || ""}`)
+    .join("\n");
+
+  return [
+    "Esta es tu lista actual:",
+    lines,
+    "Si deseas, te ayudo a agregar otro producto.",
+  ].join("\n");
+}
+
 function buildRoosbotPrompt(userMessage, products) {
-  const productsBlock = products.length
-    ? products
+  const topProducts = products.slice(0, MAX_OPTIONS);
+  const productsBlock = topProducts.length
+    ? topProducts
         .map(
           (product, index) =>
             `${index + 1}. ${product.name} | Precio: ${product.price || "N/D"} ${product.currency || ""} | Stock: ${product.stockStatus || "N/D"} | Categorias: ${product.categories || "N/D"} | Link: ${product.url || "N/D"} | Descripcion: ${product.shortDescription || "N/D"}`
@@ -152,10 +285,11 @@ function buildRoosbotPrompt(userMessage, products) {
   return [
     `Eres ${ROOSBOT_NAME}, asistente comercial de Roostech por WhatsApp.`,
     "Responde en espanol natural, cercano y profesional, como una persona real.",
-    "Objetivo: atender consultas, recomendar la mejor opcion segun la necesidad del cliente y cerrar venta sin sonar robotico.",
+    "Objetivo: atender consultas, recomendar lo mejor segun necesidad y cerrar venta sin sonar robotico.",
     "Reglas:",
-    "- Respuestas cortas, utiles y claras para WhatsApp.",
-    "- Si recomiendas productos, menciona 1 a 3 opciones maximo y por que convienen.",
+    "- Respuesta corta: 2 a 5 lineas.",
+    "- Si recomiendas productos, menciona 1 a 3 opciones maximo.",
+    "- Estructura sugerida: saludo breve, opciones con beneficio corto, pregunta de cierre.",
     "- Si falta informacion, haz una pregunta breve para afinar recomendacion.",
     "- No inventes precios, stock ni enlaces. Usa solo la data disponible.",
     "- Si no hay productos para esa consulta, dilo con honestidad y ofrece alternativa.",
@@ -169,27 +303,24 @@ function buildRoosbotPrompt(userMessage, products) {
   ].join("\n");
 }
 
-// 1. RUTA DE INICIO (Para que no salga "Cannot GET /")
 app.get("/", (req, res) => {
   res.status(200).send("API de Roostech activa en Render.");
 });
 
-// 2. RUTA DE VERIFICACIÓN PARA META (GET)
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
   if (mode && token === VERIFY_TOKEN) {
-    console.log("✅ Webhook verificado correctamente.");
+    console.log("Webhook verificado correctamente.");
     return res.status(200).send(challenge);
-  } else {
-    console.error("❌ Fallo en la verificación del token.");
-    return res.sendStatus(403);
   }
+
+  console.error("Fallo en la verificacion del token.");
+  return res.sendStatus(403);
 });
 
-// 3. RUTA DE RECEPCIÓN DE MENSAJES (POST)
 app.post("/webhook", async (req, res) => {
   const entry = req.body.entry?.[0];
   const changes = entry?.changes?.[0];
@@ -198,13 +329,26 @@ app.post("/webhook", async (req, res) => {
   if (message) {
     const from = message.from;
     const msgText = message.text?.body;
+    const state = getUserState(from);
 
-    console.log(`📩 Mensaje de ${from}: ${msgText}`);
+    console.log(`Mensaje de ${from}: ${msgText}`);
 
     try {
-      const products = await fetchWooProducts(msgText);
-      const prompt = buildRoosbotPrompt(msgText || "", products);
-      const aiResponse = await generateAiText(prompt);
+      let aiResponse;
+
+      const addReply = handleAddToCartIntent(msgText || "", state);
+      if (addReply) {
+        aiResponse = addReply;
+      } else if (isListIntent(msgText || "")) {
+        aiResponse = handleListIntent(state);
+      } else {
+        const products = await fetchWooProducts(msgText);
+        state.lastOptions = products.slice(0, MAX_OPTIONS);
+        state.lastQuery = msgText || "";
+
+        const prompt = buildRoosbotPrompt(msgText || "", products);
+        aiResponse = await generateAiText(prompt);
+      }
 
       await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
         messaging_product: "whatsapp",
@@ -212,18 +356,19 @@ app.post("/webhook", async (req, res) => {
         type: "text",
         text: { body: aiResponse }
       }, {
-        headers: { 
-          'Authorization': `Bearer ${ACCESS_TOKEN}`,
-          'Content-Type': 'application/json' 
+        headers: {
+          Authorization: `Bearer ${ACCESS_TOKEN}`,
+          "Content-Type": "application/json"
         }
       });
-      console.log("🚀 Respuesta enviada con éxito");
+      console.log("Respuesta enviada con exito");
     } catch (error) {
-      console.error("💥 Error al enviar:", error.response?.data || error.message);
+      console.error("Error al enviar:", error.response?.data || error.message);
     }
   }
+
   res.sendStatus(200);
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🔥 Senior API lista en el puerto ${PORT}`));
+app.listen(PORT, () => console.log(`Senior API lista en el puerto ${PORT}`));
