@@ -13,6 +13,7 @@ const WC_BASE_URL = process.env.WC_BASE_URL;
 const WC_CONSUMER_KEY = process.env.WC_CONSUMER_KEY;
 const WC_CONSUMER_SECRET = process.env.WC_CONSUMER_SECRET;
 const ROOSBOT_NAME = process.env.ROOSBOT_NAME || "ROOSbot";
+const WC_SEARCH_LIMIT = Number(process.env.WC_SEARCH_LIMIT || 8);
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
@@ -44,38 +45,96 @@ function hasWooCredentials() {
   return Boolean(WC_BASE_URL && WC_CONSUMER_KEY && WC_CONSUMER_SECRET);
 }
 
+function normalizeSearchTerms(userQuery) {
+  if (!userQuery) {
+    return [];
+  }
+
+  const clean = userQuery
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const stopWords = new Set([
+    "hola", "buenas", "tienen", "tienes", "hay", "me", "puedes", "puede", "quiero",
+    "necesito", "busco", "el", "la", "los", "las", "de", "del", "para", "con", "y",
+    "por", "favor", "precio", "cuesta", "cuanto", "cuanto", "disponible", "stock", "un", "una"
+  ]);
+
+  const words = clean.split(" ").filter((word) => word.length >= 3 && !stopWords.has(word));
+  const uniqueWords = [...new Set(words)];
+
+  const terms = [];
+  if (uniqueWords.length) {
+    terms.push(uniqueWords.join(" "));
+    uniqueWords.slice(0, 3).forEach((word) => terms.push(word));
+  }
+
+  if (!terms.length && clean) {
+    terms.push(clean);
+  }
+
+  return [...new Set(terms)].slice(0, 4);
+}
+
+function mapWooProduct(product) {
+  return {
+    name: product.name,
+    price: product.price,
+    currency: product.currency,
+    shortDescription: (product.short_description || "")
+      .replace(/<[^>]*>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+    url: product.permalink,
+    stockStatus: product.stock_status,
+    categories: (product.categories || []).map((category) => category.name).join(", "),
+  };
+}
+
+async function queryWooProducts(baseUrl, searchTerm) {
+  const response = await axios.get(`${baseUrl}/wp-json/wc/v3/products`, {
+    auth: {
+      username: WC_CONSUMER_KEY,
+      password: WC_CONSUMER_SECRET,
+    },
+    params: {
+      per_page: WC_SEARCH_LIMIT,
+      status: "publish",
+      search: searchTerm || undefined,
+      orderby: "date",
+      order: "desc",
+    },
+    timeout: 10000,
+  });
+
+  return (response.data || []).map(mapWooProduct);
+}
+
 async function fetchWooProducts(userQuery) {
   if (!hasWooCredentials()) {
+    console.error("WooCommerce no configurado: faltan WC_BASE_URL, WC_CONSUMER_KEY o WC_CONSUMER_SECRET");
     return [];
   }
 
   try {
     const baseUrl = WC_BASE_URL.replace(/\/$/, "");
-    const response = await axios.get(`${baseUrl}/wp-json/wc/v3/products`, {
-      params: {
-        consumer_key: WC_CONSUMER_KEY,
-        consumer_secret: WC_CONSUMER_SECRET,
-        per_page: 6,
-        status: "publish",
-        search: userQuery || undefined,
-      },
-      timeout: 10000,
-    });
 
-    return (response.data || []).map((product) => ({
-      name: product.name,
-      price: product.price,
-      currency: product.currency,
-      shortDescription: (product.short_description || "")
-        .replace(/<[^>]*>/g, " ")
-        .replace(/\s+/g, " ")
-        .trim(),
-      url: product.permalink,
-      stockStatus: product.stock_status,
-      categories: (product.categories || []).map((category) => category.name).join(", "),
-    }));
+    const terms = normalizeSearchTerms(userQuery);
+    for (const term of terms) {
+      const products = await queryWooProducts(baseUrl, term);
+      if (products.length) {
+        return products;
+      }
+    }
+
+    // Fallback: si no hubo match por texto, devuelve catalogo reciente para recomendar alternativas reales.
+    return await queryWooProducts(baseUrl, "");
   } catch (error) {
-    console.error("Error consultando WooCommerce:", error.response?.data || error.message);
+    console.error("Error consultando WooCommerce:", error.response?.status, error.response?.data || error.message);
     return [];
   }
 }
