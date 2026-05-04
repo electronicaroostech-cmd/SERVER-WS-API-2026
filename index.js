@@ -8,7 +8,7 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const WC_BASE_URL = process.env.WC_BASE_URL;
 const WC_CONSUMER_KEY = process.env.WC_CONSUMER_KEY;
 const WC_CONSUMER_SECRET = process.env.WC_CONSUMER_SECRET;
@@ -20,8 +20,10 @@ const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const userState = new Map();
 
 async function generateAiText(prompt) {
-  const candidateModels = [GEMINI_MODEL, "gemini-2.5-flash-lite", "gemini-2.5-flash"];
+  const candidateModels = [...new Set([GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.5-flash-lite"])]
+    .filter(Boolean);
   let lastError;
+  const failedModels = [];
 
   for (const modelName of candidateModels) {
     try {
@@ -36,11 +38,26 @@ async function generateAiText(prompt) {
       throw new Error("Gemini no devolvio texto");
     } catch (error) {
       lastError = error;
-      console.error(`Modelo Gemini no disponible: ${modelName}`);
+      failedModels.push(modelName);
     }
   }
 
+  console.error(`Gemini fallo con modelos: ${failedModels.join(", ")}`);
   throw lastError;
+}
+
+async function generateAiIntroSafe(userMessage, products) {
+  const fallbackIntro = products.length
+    ? "Estas son las mejores opciones para ti:"
+    : "No veo coincidencias exactas ahora mismo.";
+
+  try {
+    const prompt = buildRoosbotPrompt(userMessage, products);
+    return await generateAiText(prompt);
+  } catch (error) {
+    console.error("Fallo Gemini, usando intro por defecto:", error.message);
+    return fallbackIntro;
+  }
 }
 
 function hasWooCredentials() {
@@ -62,6 +79,16 @@ function mapWooProduct(product) {
     stockStatus: product.stock_status,
     categories: (product.categories || []).map((category) => category.name).join(", "),
   };
+}
+
+function normalizeText(value) {
+  return (value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 async function queryWooProducts(baseUrl, searchTerm, limit) {
@@ -103,12 +130,7 @@ function cleanSearchQuery(userQuery) {
     "que", "cual", "cuales", "como", "donde", "cuando", "quien",
   ]);
 
-  return (userQuery || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
+  return normalizeText(userQuery)
     .trim()
     .split(" ")
     .filter((w) => w.length >= 2 && !stopWords.has(w))
@@ -116,49 +138,98 @@ function cleanSearchQuery(userQuery) {
 }
 
 function scoreProduct(product, cleanedPhrase, keywords) {
-  const titleNorm = (product.name || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "");
-
-  const broadHaystack = [product.sku, product.categories, product.shortDescription]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "");
+  const titleNorm = normalizeText(product.name);
+  const skuNorm = normalizeText(product.sku);
+  const catNorm = normalizeText(product.categories);
+  const descNorm = normalizeText(product.shortDescription);
+  const broadHaystack = `${skuNorm} ${catNorm} ${descNorm}`.trim();
 
   let score = 0;
+  let titleHits = 0;
+  let broadHits = 0;
 
-  // +50 si la frase completa aparece en el titulo
+  if (!titleNorm) {
+    return 0;
+  }
+
+  // Señales fuertes de intención
+  if (titleNorm === cleanedPhrase) {
+    score += 120;
+  }
+
   if (cleanedPhrase && titleNorm.includes(cleanedPhrase)) {
-    score += 50;
+    score += 80;
   }
 
   for (const kw of keywords) {
-    // +15 por palabra en titulo
-    if (titleNorm.includes(kw)) {
-      score += 15;
+    const wholeWord = new RegExp(`(^|\\s)${kw}(\\s|$)`);
+
+    if (wholeWord.test(titleNorm)) {
+      score += 18;
+      titleHits += 1;
+    } else if (titleNorm.includes(kw)) {
+      score += 10;
+      titleHits += 1;
     }
-    // +5 por palabra en SKU / categoria / descripcion
-    if (broadHaystack.includes(kw)) {
+
+    if (skuNorm.includes(kw)) {
+      score += 8;
+      broadHits += 1;
+    } else if (catNorm.includes(kw)) {
+      score += 6;
+      broadHits += 1;
+    } else if (descNorm.includes(kw)) {
+      score += 4;
+      broadHits += 1;
+    } else if (broadHaystack.includes(kw)) {
       score += 5;
+      broadHits += 1;
     }
   }
 
-  // -20 si el titulo tiene palabras de "bundle" que el usuario no pidio
+  // Bonus si todas las keywords aparecen en titulo
+  if (keywords.length > 1 && keywords.every((kw) => titleNorm.includes(kw))) {
+    score += 35;
+  }
+
+  // Penalizar accesorios/combos si usuario no los pidió
   const bundleWords = ["kit", "caja", "case", "estuche"];
   const userWantedBundle = keywords.some((kw) => bundleWords.includes(kw));
   if (!userWantedBundle) {
     for (const bw of bundleWords) {
       if (titleNorm.includes(bw)) {
-        score -= 20;
+        score -= 35;
         break;
       }
     }
   }
 
+  // Filtro mínimo de relevancia para evitar falsos positivos
+  const hasStrongSignal = cleanedPhrase && titleNorm.includes(cleanedPhrase);
+  const hasConsistentMatch = titleHits >= 2 || (titleHits >= 1 && broadHits >= 1);
+  if (!hasStrongSignal && !hasConsistentMatch) {
+    return 0;
+  }
+
   return score;
+}
+
+function buildSearchTerms(cleanedPhrase, keywords) {
+  const terms = new Set();
+  terms.add(cleanedPhrase);
+
+  // Bigrama para consultas largas (ej. "arduino uno smd" => "arduino uno")
+  if (keywords.length >= 2) {
+    terms.add(`${keywords[0]} ${keywords[1]}`);
+  }
+
+  // Keywords por longitud para capturar más candidatos sin ruido excesivo
+  keywords
+    .slice()
+    .sort((a, b) => b.length - a.length)
+    .forEach((kw) => terms.add(kw));
+
+  return [...terms].filter(Boolean).slice(0, 6);
 }
 
 async function fetchWooProducts(userQuery) {
@@ -179,12 +250,20 @@ async function fetchWooProducts(userQuery) {
 
   try {
     const baseUrl = WC_BASE_URL.replace(/\/$/, "");
+    const searchTerms = buildSearchTerms(cleanedPhrase, keywords);
+    const candidateMap = new Map();
 
-    // Busqueda hibrida: frase completa limpia como termino, pool amplio de 30 productos
-    const candidates = await queryWooProducts(baseUrl, cleanedPhrase, 30);
-    console.log(`WooCommerce devolvio ${candidates.length} candidatos para: "${cleanedPhrase}"`);
+    for (const term of searchTerms) {
+      const results = await queryWooProducts(baseUrl, term, 30);
+      for (const product of results) {
+        candidateMap.set(product.id, product);
+      }
+    }
 
-    // Scoring
+    const candidates = [...candidateMap.values()];
+    console.log(`WooCommerce devolvio ${candidates.length} candidatos unicos para: "${cleanedPhrase}"`);
+
+    // Scoring y ordenamiento
     const scored = candidates
       .map((p) => ({ product: p, score: scoreProduct(p, cleanedPhrase, keywords) }))
       .filter(({ score }) => score > 0)
@@ -473,7 +552,7 @@ app.get("/debug-products", async (req, res) => {
   }
   try {
     const baseUrl = WC_BASE_URL.replace(/\/$/, "");
-    const products = await queryWooProducts(baseUrl, query);
+    const products = await queryWooProducts(baseUrl, query, 30);
     res.json({ query, total: products.length, products });
   } catch (error) {
     res.status(500).json({ error: error.message, details: error.response?.data });
@@ -545,8 +624,7 @@ app.post("/webhook", async (req, res) => {
         state.lastOptions = products.slice(0, MAX_OPTIONS);
         state.lastQuery = msgText;
 
-        const prompt = buildRoosbotPrompt(msgText, products);
-        const aiIntro = await generateAiText(prompt);
+        const aiIntro = await generateAiIntroSafe(msgText, products);
         await sendProductsResponse(from, state.lastOptions, aiIntro);
       }
 
