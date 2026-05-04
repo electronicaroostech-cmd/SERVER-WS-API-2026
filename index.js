@@ -83,8 +83,45 @@ async function queryWooProducts(baseUrl, searchTerm, limit) {
   return (response.data || []).map(mapWooProduct);
 }
 
-function scoreProduct(product, keywords) {
-  const haystack = [product.name, product.sku, product.categories]
+function cleanSearchQuery(userQuery) {
+  const stopWords = new Set([
+    // Saludos
+    "hola", "buenas", "dias", "tardes", "noches", "saludos", "hey", "buen", "buenas",
+    // Intenciones
+    "tiene", "tienes", "tenes", "tienen", "venden", "vendes", "vende", "busco", "busca",
+    "necesito", "necesita", "quiero", "quiere", "quisiera", "quisiero",
+    "vender", "comprar", "conseguir", "obtener",
+    // Dudas comerciales
+    "precio", "costo", "valor", "cuanto", "vale", "cuesta", "cuestan",
+    "disponible", "disponibles", "stock", "hay", "info", "informacion",
+    "oferta", "descuento", "rebaja",
+    // Conectores y artículos
+    "el", "la", "los", "las", "un", "una", "unos", "unas",
+    "de", "del", "al", "en", "por", "con", "sin", "para", "que", "y", "o",
+    "me", "te", "le", "se", "nos", "puedes", "puede", "podrias", "favor",
+    // Interrogativos
+    "que", "cual", "cuales", "como", "donde", "cuando", "quien",
+  ]);
+
+  return (userQuery || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter((w) => w.length >= 2 && !stopWords.has(w))
+    .join(" ");
+}
+
+function scoreProduct(product, cleanedPhrase, keywords) {
+  const titleNorm = (product.name || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+  const broadHaystack = [product.sku, product.categories, product.shortDescription]
     .filter(Boolean)
     .join(" ")
     .toLowerCase()
@@ -93,21 +130,32 @@ function scoreProduct(product, keywords) {
 
   let score = 0;
 
+  // +50 si la frase completa aparece en el titulo
+  if (cleanedPhrase && titleNorm.includes(cleanedPhrase)) {
+    score += 50;
+  }
+
   for (const kw of keywords) {
-    if (haystack.includes(kw)) {
-      score += 1;
+    // +15 por palabra en titulo
+    if (titleNorm.includes(kw)) {
+      score += 15;
+    }
+    // +5 por palabra en SKU / categoria / descripcion
+    if (broadHaystack.includes(kw)) {
+      score += 5;
     }
   }
 
-  // Bonus si la frase completa aparece en el nombre del producto
-  const fullPhrase = keywords.join(" ");
-  const productName = product.name
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "");
-
-  if (productName.includes(fullPhrase)) {
-    score += keywords.length;
+  // -20 si el titulo tiene palabras de "bundle" que el usuario no pidio
+  const bundleWords = ["kit", "caja", "case", "estuche"];
+  const userWantedBundle = keywords.some((kw) => bundleWords.includes(kw));
+  if (!userWantedBundle) {
+    for (const bw of bundleWords) {
+      if (titleNorm.includes(bw)) {
+        score -= 20;
+        break;
+      }
+    }
   }
 
   return score;
@@ -119,60 +167,42 @@ async function fetchWooProducts(userQuery) {
     return [];
   }
 
-  const clean = (userQuery || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  const cleanedPhrase = cleanSearchQuery(userQuery);
 
-  const ignoreWords = new Set([
-    "hola", "buenas", "tienen", "tienes", "hay", "me", "puedes", "puede", "quiero",
-    "necesito", "busco", "el", "la", "los", "las", "de", "del", "para", "con", "y",
-    "por", "favor", "precio", "cuesta", "cuanto", "disponible", "stock",
-  ]);
-
-  const keywords = clean.split(" ").filter((w) => w.length >= 2 && !ignoreWords.has(w));
-
-  if (!keywords.length) {
+  if (!cleanedPhrase) {
+    console.log("Query limpio vacio, sin busqueda.");
     return [];
   }
 
-  console.log(`Keywords de busqueda: [${keywords.join(", ")}]`);
+  const keywords = cleanedPhrase.split(" ").filter((w) => w.length >= 2);
+  console.log(`Query limpio: "${cleanedPhrase}" | Keywords: [${keywords.join(", ")}]`);
 
   try {
     const baseUrl = WC_BASE_URL.replace(/\/$/, "");
 
-    // Usar la keyword mas larga como ancla para la búsqueda en WooCommerce
-    const mainKeyword = keywords.slice().sort((a, b) => b.length - a.length)[0];
-    let candidates = await queryWooProducts(baseUrl, mainKeyword, 50);
+    // Busqueda hibrida: frase completa limpia como termino, pool amplio de 30 productos
+    const candidates = await queryWooProducts(baseUrl, cleanedPhrase, 30);
+    console.log(`WooCommerce devolvio ${candidates.length} candidatos para: "${cleanedPhrase}"`);
 
-    // Si no devuelve nada con la keyword principal, traer catalogo amplio para scoring local
-    if (!candidates.length) {
-      console.log(`Sin resultados para "${mainKeyword}", aplicando scoring sobre catalogo amplio`);
-      candidates = await queryWooProducts(baseUrl, "", 50);
-    }
-
-    // Scoring local: filtrar y ordenar por coincidencia de keywords
+    // Scoring
     const scored = candidates
-      .map((p) => ({ product: p, score: scoreProduct(p, keywords) }))
+      .map((p) => ({ product: p, score: scoreProduct(p, cleanedPhrase, keywords) }))
       .filter(({ score }) => score > 0)
       .sort((a, b) => b.score - a.score);
 
     if (!scored.length) {
-      console.log("Scoring: ningun producto coincide con las keywords del usuario.");
+      console.log("Scoring: ningun producto supero 0 puntos.");
       return [];
     }
 
     console.log(
-      `Scoring top: ${scored
+      `Top scoring: ${scored
         .slice(0, 5)
-        .map((s) => `${s.product.name}(${s.score})`)
+        .map((s) => `${s.product.name}(${s.score}pts)`)
         .join(" | ")}`
     );
 
-    return scored.slice(0, WC_SEARCH_LIMIT).map((s) => s.product);
+    return scored.slice(0, MAX_OPTIONS).map((s) => s.product);
   } catch (error) {
     console.error("Error consultando WooCommerce:", error.response?.status, error.response?.data || error.message);
     return [];
@@ -314,28 +344,28 @@ function buildRoosbotPrompt(userMessage, products) {
 
   const productsBlock = hayProductos
     ? topProducts
-        .map(
-          (product, index) =>
-            `${index + 1}. ${product.name} | Precio: ${product.price || "N/D"} ${product.currency || ""} | Stock: ${product.stockStatus || "N/D"} | Link: ${product.url || "N/D"}`
-        )
-        .join("\n")
+      .map(
+        (product, index) =>
+          `${index + 1}. ${product.name} | Precio: ${product.price || "N/D"} ${product.currency || ""} | Stock: ${product.stockStatus || "N/D"} | Link: ${product.url || "N/D"}`
+      )
+      .join("\n")
     : "CATALOGO VACIO: no se encontraron productos para esta consulta.";
 
   const instruccionProductos = hayProductos
     ? [
-        "HAY PRODUCTOS DISPONIBLES. DEBES mostrarlos directamente.",
-        "Formato obligatorio:",
-        "- Una linea por producto: nombre, precio y link.",
-        "- Maximo 2 lineas de texto tuyo (no preguntes el proyecto, no pidas mas datos).",
-        "- Si el cliente pide uno especifico y esta en el catalogo, muestra ese primero.",
-        "- Puedes cerrar con UNA frase de ayuda como 'Escribe *agregar 1* para apartar'.",
-      ].join("\n")
+      "HAY PRODUCTOS DISPONIBLES. DEBES mostrarlos directamente.",
+      "Formato obligatorio:",
+      "- Una linea por producto: nombre, precio y link.",
+      "- Maximo 2 lineas de texto tuyo (no preguntes el proyecto, no pidas mas datos).",
+      "- Si el cliente pide uno especifico y esta en el catalogo, muestra ese primero.",
+      "- Puedes cerrar con UNA frase de ayuda como 'Escribe *agregar 1* para apartar'.",
+    ].join("\n")
     : [
-        "NO hay productos que coincidan exactamente.",
-        "Di claramente que no tenemos ese producto.",
-        "Si el catalogo tiene productos relacionados, menciona 1 o 2 como alternativa real.",
-        "No preguntes el proyecto. No inventes productos.",
-      ].join("\n");
+      "NO hay productos que coincidan exactamente.",
+      "Di claramente que no tenemos ese producto.",
+      "Si el catalogo tiene productos relacionados, menciona 1 o 2 como alternativa real.",
+      "No preguntes el proyecto. No inventes productos.",
+    ].join("\n");
 
   return [
     `Eres ${ROOSBOT_NAME}, vendedor de Roostech en WhatsApp. Responde como persona real, directo y sin rodeos.`,
