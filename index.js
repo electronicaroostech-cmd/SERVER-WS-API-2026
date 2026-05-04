@@ -47,42 +47,6 @@ function hasWooCredentials() {
   return Boolean(WC_BASE_URL && WC_CONSUMER_KEY && WC_CONSUMER_SECRET);
 }
 
-function normalizeSearchTerms(userQuery) {
-  if (!userQuery) {
-    return [];
-  }
-
-  const clean = userQuery
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  const stopWords = new Set([
-    "hola", "buenas", "tienen", "tienes", "hay", "me", "puedes", "puede", "quiero",
-    "necesito", "busco", "el", "la", "los", "las", "de", "del", "para", "con", "y",
-    "por", "favor", "precio", "cuesta", "cuanto", "disponible", "stock"
-    // NOTA: NO incluir "un", "una", "uno" porque son parte de nombres de productos (Arduino UNO, etc.)
-  ]);
-
-  const words = clean.split(" ").filter((word) => word.length >= 3 && !stopWords.has(word));
-  const uniqueWords = [...new Set(words)];
-
-  const terms = [];
-  if (uniqueWords.length) {
-    terms.push(uniqueWords.join(" "));
-    uniqueWords.slice(0, 3).forEach((word) => terms.push(word));
-  }
-
-  if (!terms.length && clean) {
-    terms.push(clean);
-  }
-
-  return [...new Set(terms)].slice(0, 4);
-}
-
 function mapWooProduct(product) {
   return {
     id: product.id,
@@ -100,14 +64,14 @@ function mapWooProduct(product) {
   };
 }
 
-async function queryWooProducts(baseUrl, searchTerm) {
+async function queryWooProducts(baseUrl, searchTerm, limit) {
   const response = await axios.get(`${baseUrl}/wp-json/wc/v3/products`, {
     auth: {
       username: WC_CONSUMER_KEY,
       password: WC_CONSUMER_SECRET,
     },
     params: {
-      per_page: WC_SEARCH_LIMIT,
+      per_page: limit || WC_SEARCH_LIMIT,
       status: "publish",
       search: searchTerm || undefined,
       orderby: "date",
@@ -119,24 +83,96 @@ async function queryWooProducts(baseUrl, searchTerm) {
   return (response.data || []).map(mapWooProduct);
 }
 
+function scoreProduct(product, keywords) {
+  const haystack = [product.name, product.sku, product.categories]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+  let score = 0;
+
+  for (const kw of keywords) {
+    if (haystack.includes(kw)) {
+      score += 1;
+    }
+  }
+
+  // Bonus si la frase completa aparece en el nombre del producto
+  const fullPhrase = keywords.join(" ");
+  const productName = product.name
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+  if (productName.includes(fullPhrase)) {
+    score += keywords.length;
+  }
+
+  return score;
+}
+
 async function fetchWooProducts(userQuery) {
   if (!hasWooCredentials()) {
     console.error("WooCommerce no configurado: faltan WC_BASE_URL, WC_CONSUMER_KEY o WC_CONSUMER_SECRET");
     return [];
   }
 
+  const clean = (userQuery || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const ignoreWords = new Set([
+    "hola", "buenas", "tienen", "tienes", "hay", "me", "puedes", "puede", "quiero",
+    "necesito", "busco", "el", "la", "los", "las", "de", "del", "para", "con", "y",
+    "por", "favor", "precio", "cuesta", "cuanto", "disponible", "stock",
+  ]);
+
+  const keywords = clean.split(" ").filter((w) => w.length >= 2 && !ignoreWords.has(w));
+
+  if (!keywords.length) {
+    return [];
+  }
+
+  console.log(`Keywords de busqueda: [${keywords.join(", ")}]`);
+
   try {
     const baseUrl = WC_BASE_URL.replace(/\/$/, "");
 
-    const terms = normalizeSearchTerms(userQuery);
-    for (const term of terms) {
-      const products = await queryWooProducts(baseUrl, term);
-      if (products.length) {
-        return products;
-      }
+    // Usar la keyword mas larga como ancla para la búsqueda en WooCommerce
+    const mainKeyword = keywords.slice().sort((a, b) => b.length - a.length)[0];
+    let candidates = await queryWooProducts(baseUrl, mainKeyword, 50);
+
+    // Si no devuelve nada con la keyword principal, traer catalogo amplio para scoring local
+    if (!candidates.length) {
+      console.log(`Sin resultados para "${mainKeyword}", aplicando scoring sobre catalogo amplio`);
+      candidates = await queryWooProducts(baseUrl, "", 50);
     }
 
-    return await queryWooProducts(baseUrl, "");
+    // Scoring local: filtrar y ordenar por coincidencia de keywords
+    const scored = candidates
+      .map((p) => ({ product: p, score: scoreProduct(p, keywords) }))
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    if (!scored.length) {
+      console.log("Scoring: ningun producto coincide con las keywords del usuario.");
+      return [];
+    }
+
+    console.log(
+      `Scoring top: ${scored
+        .slice(0, 5)
+        .map((s) => `${s.product.name}(${s.score})`)
+        .join(" | ")}`
+    );
+
+    return scored.slice(0, WC_SEARCH_LIMIT).map((s) => s.product);
   } catch (error) {
     console.error("Error consultando WooCommerce:", error.response?.status, error.response?.data || error.message);
     return [];
