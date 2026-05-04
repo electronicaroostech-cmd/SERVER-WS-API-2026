@@ -8,9 +8,33 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-lite-preview-06-17" });
+
+async function generateAiText(prompt) {
+  const candidateModels = [GEMINI_MODEL, "gemini-2.5-flash-lite", "gemini-2.5-flash"];
+  let lastError;
+
+  for (const modelName of candidateModels) {
+    try {
+      const model = genAI.getGenerativeModel({ model: modelName });
+      const result = await model.generateContent(prompt);
+      const text = result.response?.text?.();
+
+      if (text) {
+        return text;
+      }
+
+      throw new Error("Gemini no devolvio texto");
+    } catch (error) {
+      lastError = error;
+      console.error(`Modelo Gemini no disponible: ${modelName}`);
+    }
+  }
+
+  throw lastError;
+}
 
 // 1. RUTA DE INICIO (Para que no salga "Cannot GET /")
 app.get("/", (req, res) => {
@@ -45,9 +69,7 @@ app.post("/webhook", async (req, res) => {
     console.log(`📩 Mensaje de ${from}: ${msgText}`);
 
     try {
-      // Generar respuesta con Gemini 2.5 Flash Lite
-      const result = await model.generateContent(msgText);
-      const aiResponse = result.response.text();
+      const aiResponse = await generateAiText(msgText);
 
       await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
         messaging_product: "whatsapp",
