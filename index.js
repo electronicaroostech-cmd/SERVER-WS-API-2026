@@ -15,9 +15,14 @@ const WC_CONSUMER_SECRET = process.env.WC_CONSUMER_SECRET;
 const ROOSBOT_NAME = process.env.ROOSBOT_NAME || "ROOSbot";
 const WC_SEARCH_LIMIT = Number(process.env.WC_SEARCH_LIMIT || 8);
 const MAX_OPTIONS = Number(process.env.ROOSBOT_MAX_OPTIONS || 3);
+const WC_TIMEOUT_MS = Number(process.env.WC_TIMEOUT_MS || 6000);
+const SEARCH_CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS || 60000);
+const ENABLE_GEMINI_INTRO = process.env.ENABLE_GEMINI_INTRO === "true";
+const SEND_ALL_PRODUCT_IMAGES = process.env.SEND_ALL_PRODUCT_IMAGES === "true";
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const userState = new Map();
+const searchCache = new Map();
 
 async function generateAiText(prompt) {
   const candidateModels = [...new Set([GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.5-flash-lite"])]
@@ -50,6 +55,10 @@ async function generateAiIntroSafe(userMessage, products) {
   const fallbackIntro = products.length
     ? "Estas son las mejores opciones para ti:"
     : "No veo coincidencias exactas ahora mismo.";
+
+  if (!ENABLE_GEMINI_INTRO) {
+    return fallbackIntro;
+  }
 
   try {
     const prompt = buildRoosbotPrompt(userMessage, products);
@@ -105,10 +114,26 @@ async function queryWooProducts(baseUrl, searchTerm, limit) {
       orderby: "date",
       order: "desc",
     },
-    timeout: 10000,
+    timeout: WC_TIMEOUT_MS,
   });
 
   return (response.data || []).map(mapWooProduct);
+}
+
+function getCachedSearch(cleanedPhrase) {
+  const cached = searchCache.get(cleanedPhrase);
+  if (!cached) {
+    return null;
+  }
+  if (Date.now() - cached.ts > SEARCH_CACHE_TTL_MS) {
+    searchCache.delete(cleanedPhrase);
+    return null;
+  }
+  return cached.data;
+}
+
+function setCachedSearch(cleanedPhrase, data) {
+  searchCache.set(cleanedPhrase, { ts: Date.now(), data });
 }
 
 function cleanSearchQuery(userQuery) {
@@ -246,6 +271,12 @@ async function fetchWooProducts(userQuery) {
     return [];
   }
 
+  const cached = getCachedSearch(cleanedPhrase);
+  if (cached) {
+    console.log(`Cache hit para: "${cleanedPhrase}"`);
+    return cached;
+  }
+
   const keywords = cleanedPhrase.split(" ").filter((w) => w.length >= 2);
   console.log(`Query limpio: "${cleanedPhrase}" | Keywords: [${keywords.join(", ")}]`);
 
@@ -254,9 +285,15 @@ async function fetchWooProducts(userQuery) {
     const searchTerms = buildSearchTerms(cleanedPhrase, keywords);
     const candidateMap = new Map();
 
-    for (const term of searchTerms) {
-      const results = await queryWooProducts(baseUrl, term, 30);
-      for (const product of results) {
+    const responses = await Promise.allSettled(
+      searchTerms.map((term) => queryWooProducts(baseUrl, term, 30))
+    );
+
+    for (const resp of responses) {
+      if (resp.status !== "fulfilled") {
+        continue;
+      }
+      for (const product of resp.value) {
         candidateMap.set(product.id, product);
       }
     }
@@ -282,7 +319,9 @@ async function fetchWooProducts(userQuery) {
         .join(" | ")}`
     );
 
-    return scored.slice(0, MAX_OPTIONS).map((s) => s.product);
+    const ranked = scored.slice(0, MAX_OPTIONS).map((s) => s.product);
+    setCachedSearch(cleanedPhrase, ranked);
+    return ranked;
   } catch (error) {
     console.error("Error consultando WooCommerce:", error.response?.status, error.response?.data || error.message);
     return [];
@@ -480,6 +519,32 @@ async function sendTextMessage(to, text) {
   });
 }
 
+async function sendImageMessage(to, imageUrl, caption = "") {
+  if (!imageUrl) {
+    return;
+  }
+
+  await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
+    messaging_product: "whatsapp",
+    to,
+    type: "image",
+    image: {
+      link: imageUrl,
+      caption: caption.slice(0, 1024)
+    }
+  }, {
+    headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" }
+  });
+}
+
+async function sendProductImagesGallery(to, products) {
+  const gallery = products.slice(0, MAX_OPTIONS).filter((p) => p.imageUrl);
+  for (let i = 0; i < gallery.length; i += 1) {
+    const p = gallery[i];
+    await sendImageMessage(to, p.imageUrl, `Opcion ${i + 1}: ${p.name}`);
+  }
+}
+
 async function sendInteractiveButtons(to, bodyText, buttons, imageUrl = null) {
   // WhatsApp: max 3 botones, titulo max 20 chars
   const safeButtons = buttons.slice(0, 3).map((btn) => ({
@@ -545,7 +610,12 @@ async function sendProductsResponse(to, products, aiIntro) {
   }
 
   try {
-    await sendInteractiveButtons(to, bodyText.slice(0, 1024), buttons, topImageUrl);
+    if (SEND_ALL_PRODUCT_IMAGES) {
+      await sendProductImagesGallery(to, products);
+      await sendInteractiveButtons(to, bodyText.slice(0, 1024), buttons, null);
+    } else {
+      await sendInteractiveButtons(to, bodyText.slice(0, 1024), buttons, topImageUrl);
+    }
   } catch {
     // Fallback a texto plano si el interactive falla (ej. número no registrado en WA Business)
     await sendTextMessage(to, bodyText + "\n\nEscribe *agregar 1*, *agregar 2* o *ver lista*.");
