@@ -14,7 +14,7 @@ const WC_CONSUMER_KEY = process.env.WC_CONSUMER_KEY;
 const WC_CONSUMER_SECRET = process.env.WC_CONSUMER_SECRET;
 const ROOSBOT_NAME = process.env.ROOSBOT_NAME || "Roosbot";
 const WC_SEARCH_LIMIT = Number(process.env.WC_SEARCH_LIMIT || 8);
-const MAX_OPTIONS = Math.max(5, Number(process.env.ROOSBOT_MAX_OPTIONS || 5));
+const MAX_OPTIONS = Math.max(10, Number(process.env.ROOSBOT_MAX_OPTIONS || 10));
 const WC_TIMEOUT_MS = Number(process.env.WC_TIMEOUT_MS || 6000);
 const SEARCH_CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS || 60000);
 const MESSAGE_DEDUP_TTL_MS = Number(process.env.MESSAGE_DEDUP_TTL_MS || 120000);
@@ -708,11 +708,11 @@ function buildCartTotalsText(state) {
   return lines.length ? lines.join("\n") : "Total: N/D";
 }
 
-async function sendPostCartActions(to, bodyText = "Que deseas hacer ahora?") {
+async function sendPostCartActions(to, bodyText = "Que deseas hacer ahora?", imageUrl = null) {
   await sendInteractiveButtons(to, bodyText.slice(0, 1024), [
     { id: "eliminar_ultimo", title: "Eliminar ultimo" },
     { id: "finalizar_compra", title: "Finalizar compra" },
-  ]);
+  ], null, imageUrl);
   await sendTextMessage(to, "O escribe el nombre de otro producto para seguir buscando.");
 }
 
@@ -771,13 +771,8 @@ async function finalizeProductSelectionWithQuantity(to, state, quantity) {
   const totals = buildCartTotalsText(state);
   const confirmationText = `${buildSelectionConfirmationText(cartItem, cartPreview)}\n\n${totals}`;
 
-  // Imagen primero (se enviará con timestamp más temprano en WhatsApp)
-  if (selected.imageUrl) {
-    await sendImageMessage(to, selected.imageUrl, selected.name.slice(0, 1024)).catch(() => {});
-  }
-
-  // Confirmación + botones en UN SOLO mensaje interactivo → orden garantizado entre ellos
-  await sendPostCartActions(to, confirmationText);
+  // Imagen incrustada como header del mensaje interactivo → imagen + texto + botones en UN SOLO mensaje
+  await sendPostCartActions(to, confirmationText, selected.imageUrl || null);
 }
 
 async function sendInteractiveList(to, bodyText, products) {
@@ -800,7 +795,7 @@ async function sendInteractiveList(to, bodyText, products) {
   });
 }
 
-async function sendInteractiveButtons(to, bodyText, buttons, contextMessageId = null) {
+async function sendInteractiveButtons(to, bodyText, buttons, contextMessageId = null, imageUrl = null) {
   // WhatsApp: max 3 botones, titulo max 20 chars
   const safeButtons = buttons.slice(0, 3).map((btn) => ({
     type: "reply",
@@ -815,6 +810,10 @@ async function sendInteractiveButtons(to, bodyText, buttons, contextMessageId = 
     body: { text: bodyText },
     action: { buttons: safeButtons }
   };
+
+  if (imageUrl) {
+    interactivePayload.header = { type: "image", image: { link: imageUrl } };
+  }
 
   const payload = {
     messaging_product: "whatsapp",
