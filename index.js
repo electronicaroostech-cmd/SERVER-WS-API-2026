@@ -17,12 +17,34 @@ const WC_SEARCH_LIMIT = Number(process.env.WC_SEARCH_LIMIT || 8);
 const MAX_OPTIONS = Math.max(5, Number(process.env.ROOSBOT_MAX_OPTIONS || 5));
 const WC_TIMEOUT_MS = Number(process.env.WC_TIMEOUT_MS || 6000);
 const SEARCH_CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS || 60000);
+const MESSAGE_DEDUP_TTL_MS = Number(process.env.MESSAGE_DEDUP_TTL_MS || 120000);
 const ENABLE_GEMINI_INTRO = process.env.ENABLE_GEMINI_INTRO === "true";
 const WELCOME_IMAGE_URL = process.env.WELCOME_IMAGE_URL || "https://roostech.co/wp-content/uploads/2026/05/rosboot.jpeg";
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const userState = new Map();
 const searchCache = new Map();
+const processedMessageIds = new Map();
+
+function isDuplicateInboundMessage(messageId) {
+  if (!messageId) {
+    return false;
+  }
+
+  const now = Date.now();
+  for (const [id, ts] of processedMessageIds.entries()) {
+    if (now - ts > MESSAGE_DEDUP_TTL_MS) {
+      processedMessageIds.delete(id);
+    }
+  }
+
+  if (processedMessageIds.has(messageId)) {
+    return true;
+  }
+
+  processedMessageIds.set(messageId, now);
+  return false;
+}
 
 async function generateAiText(prompt) {
   const candidateModels = [...new Set([GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.5-flash-lite"])]
@@ -54,9 +76,9 @@ async function generateAiText(prompt) {
 async function generateAiIntroSafe(userMessage, products, isFirstTurn = false) {
   const esPrimerMensaje = Boolean(isFirstTurn);
   const fallbackIntro = esPrimerMensaje
-    ? "Soy Roosbot, tu asistente de Roostech. Escribe el nombre del producto que necesitas."
+    ? "Hola! Soy Roosbot, tu asistente de Roostech. Escribe el nombre del producto que necesitas."
     : products.length
-      ? "Sí Encontramos estas opciones para ti, Elije una :"
+      ? "Sí, Encontramos estas opciones para ti, Elije una :"
       : "No veo coincidencias exactas ahora mismo. intenta con otra palabra similar o mas general.";
 
   if (!ENABLE_GEMINI_INTRO) {
@@ -749,13 +771,11 @@ async function finalizeProductSelectionWithQuantity(to, state, quantity) {
   const totals = buildCartTotalsText(state);
   const confirmationText = `${buildSelectionConfirmationText(cartItem, cartPreview)}\n\n${totals}`;
 
-  let anchorMessageId = await sendTextMessage(to, confirmationText);
-
+  let anchorMessageId = null;
   if (selected.imageUrl) {
-    const imageMessageId = await sendImageMessage(to, selected.imageUrl, selected.name.slice(0, 1024), anchorMessageId);
-    if (imageMessageId) {
-      anchorMessageId = imageMessageId;
-    }
+    anchorMessageId = await sendImageMessage(to, selected.imageUrl, confirmationText.slice(0, 1024));
+  } else {
+    anchorMessageId = await sendTextMessage(to, confirmationText);
   }
 
   await sendPostCartActions(to, anchorMessageId);
@@ -877,6 +897,11 @@ app.post("/webhook", async (req, res) => {
   const message = changes?.value?.messages?.[0];
 
   if (message) {
+    if (isDuplicateInboundMessage(message.id)) {
+      console.log(`Mensaje duplicado ignorado: ${message.id}`);
+      return res.sendStatus(200);
+    }
+
     const from = message.from;
     const state = getUserState(from);
 
