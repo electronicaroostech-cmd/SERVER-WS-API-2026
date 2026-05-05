@@ -18,6 +18,7 @@ const MAX_OPTIONS = Number(process.env.ROOSBOT_MAX_OPTIONS || 3);
 const WC_TIMEOUT_MS = Number(process.env.WC_TIMEOUT_MS || 6000);
 const SEARCH_CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS || 60000);
 const ENABLE_GEMINI_INTRO = process.env.ENABLE_GEMINI_INTRO === "true";
+const WELCOME_IMAGE_URL = process.env.WELCOME_IMAGE_URL || "https://roostech.co/wp-content/uploads/2026/05/rosboot.jpeg";
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const userState = new Map();
@@ -50,7 +51,7 @@ async function generateAiText(prompt) {
   throw lastError;
 }
 
-async function generateAiIntroSafe(userMessage, products) {
+async function generateAiIntroSafe(userMessage, products, cartSize = 0) {
   const fallbackIntro = products.length
     ? "Estas son las mejores opciones para ti:"
     : "No veo coincidencias exactas ahora mismo.";
@@ -60,7 +61,7 @@ async function generateAiIntroSafe(userMessage, products) {
   }
 
   try {
-    const prompt = buildRoosbotPrompt(userMessage, products);
+    const prompt = buildRoosbotPrompt(userMessage, products, cartSize);
     return await generateAiText(prompt);
   } catch (error) {
     console.error("Fallo Gemini, usando intro por defecto:", error.message);
@@ -332,6 +333,7 @@ function initialUserState() {
     lastOptions: [],
     cart: [],
     lastQuery: "",
+    hasSentWelcome: false,
   };
 }
 
@@ -456,9 +458,10 @@ function handleListIntent(state) {
   ].join("\n");
 }
 
-function buildRoosbotPrompt(userMessage, products) {
+function buildRoosbotPrompt(userMessage, products, cartSize = 0) {
   const topProducts = products.slice(0, MAX_OPTIONS);
   const hayProductos = topProducts.length > 0;
+  const esPrimerMensaje = cartSize === 0;
 
   const productsBlock = hayProductos
     ? topProducts
@@ -485,10 +488,14 @@ function buildRoosbotPrompt(userMessage, products) {
       "No preguntes el proyecto. No inventes productos.",
     ].join("\n");
 
+    const reglaSaludo = esPrimerMensaje
+      ? "- Es el PRIMER mensaje del usuario: incluye un saludo breve y profesional al inicio de tu frase (ej: 'Hola, tenemos esto para ti:')."
+      : "- NO incluyas saludos. El usuario ya conoce el bot. Ve directo al punto.";
+
   return [
     `Eres ${ROOSBOT_NAME}, vendedor de Roostech en WhatsApp. Responde como persona real, directo y sin rodeos.`,
     "REGLAS ABSOLUTAS:",
-    "- NO digas 'Hola' ni saludos en cada mensaje.",
+      reglaSaludo,
     "- NO hagas preguntas sobre el proyecto del cliente si ya pidio un producto especifico.",
     "- NO inventes precios, stock ni links. Solo usa los datos del catalogo.",
     "- Tu respuesta es SOLO la introduccion: maximo 1 sola frase corta.",
@@ -518,7 +525,20 @@ async function sendTextMessage(to, text) {
   });
 }
 
+async function sendImageMessage(to, imageUrl, caption = "") {
+  if (!imageUrl) return;
+  await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
+    messaging_product: "whatsapp",
+    to,
+    type: "image",
+    image: { link: imageUrl, caption: caption.slice(0, 1024) }
+  }, {
+    headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" }
+  });
+}
+
 async function sendInteractiveList(to, bodyText, products) {
+
   const rows = products.slice(0, 10).map((p, i) => ({
     id: `select_${i + 1}`,
     title: p.name.substring(0, 24),
@@ -568,12 +588,18 @@ async function sendInteractiveButtons(to, bodyText, buttons) {
   });
 }
 
-async function sendProductsResponse(to, products, aiIntro) {
+async function sendProductsResponse(to, products, aiIntro, showWelcomeImage = false) {
   if (!products.length) {
+    if (showWelcomeImage && WELCOME_IMAGE_URL) {
+      await sendImageMessage(to, WELCOME_IMAGE_URL, ROOSBOT_NAME).catch(() => {});
+    }
     return await sendTextMessage(to, aiIntro);
   }
 
   try {
+    if (showWelcomeImage && WELCOME_IMAGE_URL) {
+      await sendImageMessage(to, WELCOME_IMAGE_URL, ROOSBOT_NAME).catch(() => {});
+    }
     await sendInteractiveList(to, aiIntro, products);
   } catch (err) {
     console.error("sendInteractiveList fallo:", JSON.stringify(err.response?.data ?? err.message, null, 2));
@@ -647,6 +673,9 @@ app.post("/webhook", async (req, res) => {
           if (selected) {
             state.cart.push({ id: selected.id, name: selected.name, price: selected.price, currency: selected.currency, url: selected.url });
             const cartPreview = state.cart.map((item, i) => `${i + 1}. ${item.name} — $${item.price || "N/D"} ${item.currency || ""}`).join("\n");
+            if (selected.imageUrl) {
+              await sendImageMessage(from, selected.imageUrl, selected.name).catch(() => {});
+            }
             await sendTextMessage(from, `✅ *${selected.name}* apartado.\n\n*Tu lista:*\n${cartPreview}\n\nEscribe el nombre de otro producto o *ver lista* para ver todo.`);
           } else {
             await sendTextMessage(from, "No encontre esa opcion. Dime el producto que quieres y te lo busco.");
@@ -670,8 +699,12 @@ app.post("/webhook", async (req, res) => {
         state.lastOptions = products.slice(0, MAX_OPTIONS);
         state.lastQuery = msgText;
 
-        const aiIntro = await generateAiIntroSafe(msgText, products);
-        await sendProductsResponse(from, state.lastOptions, aiIntro);
+        const shouldSendWelcome = !state.hasSentWelcome;
+        const aiIntro = await generateAiIntroSafe(msgText, products, state.cart.length);
+        await sendProductsResponse(from, state.lastOptions, aiIntro, shouldSendWelcome);
+        if (shouldSendWelcome) {
+          state.hasSentWelcome = true;
+        }
       }
 
       console.log("Respuesta enviada con exito");
