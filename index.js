@@ -51,8 +51,8 @@ async function generateAiText(prompt) {
   throw lastError;
 }
 
-async function generateAiIntroSafe(userMessage, products, cartSize = 0) {
-  const esPrimerMensaje = cartSize === 0;
+async function generateAiIntroSafe(userMessage, products, isFirstTurn = false) {
+  const esPrimerMensaje = Boolean(isFirstTurn);
   const fallbackIntro = esPrimerMensaje
     ? "Soy ROOSbot, tu asistente de Roostech. Escribe el nombre del producto que necesitas."
     : products.length
@@ -64,7 +64,7 @@ async function generateAiIntroSafe(userMessage, products, cartSize = 0) {
   }
 
   try {
-    const prompt = buildRoosbotPrompt(userMessage, products, cartSize);
+    const prompt = buildRoosbotPrompt(userMessage, products, esPrimerMensaje);
     return await generateAiText(prompt);
   } catch (error) {
     console.error("Fallo Gemini, usando intro por defecto:", error.message);
@@ -461,10 +461,10 @@ function handleListIntent(state) {
   ].join("\n");
 }
 
-function buildRoosbotPrompt(userMessage, products, cartSize = 0) {
+function buildRoosbotPrompt(userMessage, products, isFirstTurn = false) {
   const topProducts = products.slice(0, MAX_OPTIONS);
   const hayProductos = topProducts.length > 0;
-  const esPrimerMensaje = cartSize === 0;
+  const esPrimerMensaje = Boolean(isFirstTurn);
 
   const productsBlock = hayProductos
     ? topProducts
@@ -718,7 +718,7 @@ app.post("/webhook", async (req, res) => {
         state.lastQuery = msgText;
 
         const shouldSendWelcome = !state.hasSentWelcome;
-        const aiIntro = await generateAiIntroSafe(msgText, products, state.cart.length);
+        const aiIntro = await generateAiIntroSafe(msgText, products, shouldSendWelcome);
         await sendProductsResponse(from, state.lastOptions, aiIntro, shouldSendWelcome);
         if (shouldSendWelcome) {
           state.hasSentWelcome = true;
