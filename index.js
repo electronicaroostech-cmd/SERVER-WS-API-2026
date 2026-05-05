@@ -749,11 +749,13 @@ async function finalizeProductSelectionWithQuantity(to, state, quantity) {
   const totals = buildCartTotalsText(state);
   const confirmationText = `${buildSelectionConfirmationText(cartItem, cartPreview)}\n\n${totals}`;
 
-  let anchorMessageId = null;
+  let anchorMessageId = await sendTextMessage(to, confirmationText);
+
   if (selected.imageUrl) {
-    anchorMessageId = await sendImageMessage(to, selected.imageUrl, confirmationText.slice(0, 1024));
-  } else {
-    anchorMessageId = await sendTextMessage(to, confirmationText);
+    const imageMessageId = await sendImageMessage(to, selected.imageUrl, selected.name.slice(0, 1024), anchorMessageId);
+    if (imageMessageId) {
+      anchorMessageId = imageMessageId;
+    }
   }
 
   await sendPostCartActions(to, anchorMessageId);
