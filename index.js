@@ -94,6 +94,10 @@ function mapWooProduct(product) {
   };
 }
 
+function isProductAvailable(product) {
+  return product?.stockStatus !== "outofstock";
+}
+
 function normalizeText(value) {
   return (value || "")
     .toLowerCase()
@@ -308,7 +312,13 @@ async function fetchWooProducts(userQuery) {
     const scored = candidates
       .map((p) => ({ product: p, score: scoreProduct(p, cleanedPhrase, keywords) }))
       .filter(({ score }) => score > 0)
-      .sort((a, b) => b.score - a.score);
+      .sort((a, b) => {
+        const availabilityDiff = Number(isProductAvailable(b.product)) - Number(isProductAvailable(a.product));
+        if (availabilityDiff !== 0) {
+          return availabilityDiff;
+        }
+        return b.score - a.score;
+      });
 
     if (!scored.length) {
       console.log("Scoring: ningun producto supero 0 puntos.");
@@ -411,6 +421,14 @@ function handleAddToCartIntent(userMessage, state) {
   const selected = resolveProductFromSelection(userMessage, state.lastOptions);
   if (!selected) {
     return `Listo. Dime cual deseas agregar: 1 a ${MAX_OPTIONS} segun la ultima recomendacion, o escribe el nombre del producto.`;
+  }
+
+  if (!isProductAvailable(selected)) {
+    const alternatives = state.lastOptions.filter((product) => product.id !== selected.id && isProductAvailable(product));
+    const alternativesText = alternatives.length
+      ? ` Te recomiendo: ${alternatives.slice(0, 3).map((product) => product.name).join(", ")}.`
+      : " Ahora mismo no veo otra opcion disponible en esta busqueda.";
+    return `${selected.name} no tiene stock disponible.${alternativesText}`;
   }
 
   state.cart.push({
@@ -521,27 +539,44 @@ function buildRoosbotPrompt(userMessage, products, isFirstTurn = false) {
 
 // --- ENVÍO DE MENSAJES WHATSAPP ---
 
-async function sendTextMessage(to, text) {
-  await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
+async function sendTextMessage(to, text, contextMessageId = null) {
+  const payload = {
     messaging_product: "whatsapp",
     to,
     type: "text",
     text: { body: text, preview_url: false }
-  }, {
+  };
+
+  if (contextMessageId) {
+    payload.context = { message_id: contextMessageId };
+  }
+
+  const response = await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, payload, {
     headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" }
   });
+
+  return response.data?.messages?.[0]?.id || null;
 }
 
-async function sendImageMessage(to, imageUrl, caption = "") {
-  if (!imageUrl) return;
-  await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
+async function sendImageMessage(to, imageUrl, caption = "", contextMessageId = null) {
+  if (!imageUrl) return null;
+
+  const payload = {
     messaging_product: "whatsapp",
     to,
     type: "image",
     image: { link: imageUrl, caption: caption.slice(0, 1024) }
-  }, {
+  };
+
+  if (contextMessageId) {
+    payload.context = { message_id: contextMessageId };
+  }
+
+  const response = await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, payload, {
     headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" }
   });
+
+  return response.data?.messages?.[0]?.id || null;
 }
 
 function buildSelectionConfirmationText(selected, cartPreview) {
@@ -607,7 +642,10 @@ function buildCatalogRow(product, index) {
   const title = trimAtWord(fullName, 24);
   const remainingName = fullName.startsWith(title) ? fullName.slice(title.length).trim() : "";
   const priceText = (product.price ? `$${product.price} ${product.currency || ""}`.trim() : "Ver mas");
-  const descriptionBase = remainingName ? `${remainingName} | ${priceText}` : priceText;
+  const stockText = isProductAvailable(product) ? "Disponible" : "Sin stock";
+  const descriptionBase = remainingName
+    ? `${remainingName} | ${priceText} | ${stockText}`
+    : `${priceText} | ${stockText}`;
 
   return {
     id: `select_${index + 1}`,
@@ -648,12 +686,24 @@ function buildCartTotalsText(state) {
   return lines.length ? lines.join("\n") : "Total: N/D";
 }
 
-async function sendPostCartActions(to) {
-  await sendInteractiveButtons(to, "Que deseas hacer ahora?", [
+async function sendPostCartActions(to, contextMessageId = null) {
+  const buttonsMessageId = await sendInteractiveButtons(to, "Que deseas hacer ahora?", [
     { id: "eliminar_ultimo", title: "Eliminar ultimo" },
     { id: "finalizar_compra", title: "Finalizar compra" },
-  ]);
-  await sendTextMessage(to, "O escribe el nombre de otro producto para seguir buscando.");
+  ], contextMessageId);
+  await sendTextMessage(to, "O escribe el nombre de otro producto para seguir buscando.", buttonsMessageId);
+}
+
+async function sendOutOfStockRecommendation(to, state, selected) {
+  const alternatives = state.lastOptions.filter((product) => product.id !== selected.id && isProductAvailable(product));
+
+  if (!alternatives.length) {
+    await sendTextMessage(to, `${selected.name} no tiene stock disponible ahora mismo. Escribe otro producto y te muestro opciones.`);
+    return;
+  }
+
+  const intro = `${selected.name} no tiene stock disponible. Te recomiendo estas opciones que si tenemos:`;
+  await sendInteractiveList(to, intro, alternatives.slice(0, MAX_OPTIONS));
 }
 
 function extractQuantity(text) {
@@ -699,13 +749,14 @@ async function finalizeProductSelectionWithQuantity(to, state, quantity) {
   const totals = buildCartTotalsText(state);
   const confirmationText = `${buildSelectionConfirmationText(cartItem, cartPreview)}\n\n${totals}`;
 
+  let anchorMessageId = null;
   if (selected.imageUrl) {
-    await sendImageMessage(to, selected.imageUrl, confirmationText.slice(0, 1024));
+    anchorMessageId = await sendImageMessage(to, selected.imageUrl, confirmationText.slice(0, 1024));
   } else {
-    await sendTextMessage(to, confirmationText);
+    anchorMessageId = await sendTextMessage(to, confirmationText);
   }
 
-  await sendPostCartActions(to);
+  await sendPostCartActions(to, anchorMessageId);
 }
 
 async function sendInteractiveList(to, bodyText, products) {
@@ -728,7 +779,7 @@ async function sendInteractiveList(to, bodyText, products) {
   });
 }
 
-async function sendInteractiveButtons(to, bodyText, buttons) {
+async function sendInteractiveButtons(to, bodyText, buttons, contextMessageId = null) {
   // WhatsApp: max 3 botones, titulo max 20 chars
   const safeButtons = buttons.slice(0, 3).map((btn) => ({
     type: "reply",
@@ -744,14 +795,22 @@ async function sendInteractiveButtons(to, bodyText, buttons) {
     action: { buttons: safeButtons }
   };
 
-  await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
+  const payload = {
     messaging_product: "whatsapp",
     to,
     type: "interactive",
     interactive: interactivePayload
-  }, {
+  };
+
+  if (contextMessageId) {
+    payload.context = { message_id: contextMessageId };
+  }
+
+  const response = await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, payload, {
     headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" }
   });
+
+  return response.data?.messages?.[0]?.id || null;
 }
 
 async function sendProductsResponse(to, products, aiIntro, showWelcomeImage = false) {
@@ -873,6 +932,10 @@ app.post("/webhook", async (req, res) => {
           const index = Number(buttonReplyId.replace("agregar_", "").replace("select_", "")) - 1;
           const selected = state.lastOptions[index];
           if (selected) {
+            if (!isProductAvailable(selected)) {
+              await sendOutOfStockRecommendation(from, state, selected);
+              return res.sendStatus(200);
+            }
             state.pendingProduct = selected;
             state.awaitingQuantity = true;
             await sendInteractiveButtons(from, `Elegiste: ${selected.name}\n\nQue cantidad deseas?`, [
