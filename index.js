@@ -13,8 +13,8 @@ const WC_BASE_URL = process.env.WC_BASE_URL;
 const WC_CONSUMER_KEY = process.env.WC_CONSUMER_KEY;
 const WC_CONSUMER_SECRET = process.env.WC_CONSUMER_SECRET;
 const ROOSBOT_NAME = process.env.ROOSBOT_NAME || "Roosbot";
-const WC_SEARCH_LIMIT = Number(process.env.WC_SEARCH_LIMIT || 8);
-const MAX_OPTIONS = Math.max(10, Number(process.env.ROOSBOT_MAX_OPTIONS || 10));
+const WC_SEARCH_LIMIT = Number(process.env.WC_SEARCH_LIMIT || 20);
+const MAX_OPTIONS = Math.max(20, Number(process.env.ROOSBOT_MAX_OPTIONS || 20));
 const WC_TIMEOUT_MS = Number(process.env.WC_TIMEOUT_MS || 6000);
 const SEARCH_CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS || 60000);
 const MESSAGE_DEDUP_TTL_MS = Number(process.env.MESSAGE_DEDUP_TTL_MS || 120000);
@@ -366,6 +366,7 @@ async function fetchWooProducts(userQuery) {
 function initialUserState() {
   return {
     lastOptions: [],
+    lastOptionsOffset: 0,
     cart: [],
     lastQuery: "",
     hasSentWelcome: false,
@@ -711,25 +712,25 @@ function buildCartTotalsText(state) {
 async function sendPostCartActions(to, bodyText = "Que deseas hacer ahora?", imageUrl = null) {
   const truncatedBody = bodyText.slice(0, 1024);
   const seemsWebp = /\.webp(?:$|\?)/i.test(String(imageUrl || ""));
-  const safeImageUrl = seemsWebp ? null : imageUrl;
+  const imageToSendFirst = imageUrl && !seemsWebp
+    ? imageUrl
+    : (WELCOME_IMAGE_URL || null);
+
+  // Prioriza imagen separada para que aparezca primero en el chat.
+  if (imageToSendFirst) {
+    await sendImageMessage(to, imageToSendFirst).catch((error) => {
+      console.error("Fallo enviando imagen principal:", error.response?.data || error.message);
+    });
+  }
 
   try {
     await sendInteractiveButtons(to, truncatedBody, [
       { id: "eliminar_ultimo", title: "Eliminar ultimo" },
       { id: "finalizar_compra", title: "Finalizar compra" },
-    ], null, safeImageUrl);
-  } catch (errorWithImage) {
-    console.error("Fallo interactivo con imagen, reintentando sin imagen:", errorWithImage.response?.data || errorWithImage.message);
-
-    try {
-      await sendInteractiveButtons(to, truncatedBody, [
-        { id: "eliminar_ultimo", title: "Eliminar ultimo" },
-        { id: "finalizar_compra", title: "Finalizar compra" },
-      ]);
-    } catch (errorWithoutImage) {
-      console.error("Fallo interactivo sin imagen, usando texto plano:", errorWithoutImage.response?.data || errorWithoutImage.message);
-      await sendTextMessage(to, truncatedBody);
-    }
+    ]);
+  } catch (errorInteractive) {
+    console.error("Fallo interactivo, usando texto plano:", errorInteractive.response?.data || errorInteractive.message);
+    await sendTextMessage(to, truncatedBody);
   }
 
   await sendTextMessage(to, "O escribe el nombre de otro producto para seguir buscando.");
@@ -743,8 +744,15 @@ async function sendOutOfStockRecommendation(to, state, selected) {
     return;
   }
 
+  state.lastOptions = alternatives.slice(0, MAX_OPTIONS);
+  state.lastOptionsOffset = 0;
   const intro = `${selected.name} no tiene stock disponible. Te recomiendo estas opciones que si tenemos:`;
-  await sendInteractiveList(to, intro, alternatives.slice(0, MAX_OPTIONS));
+  await sendInteractiveList(to, intro, state.lastOptions.slice(0, 10), 0);
+  if (state.lastOptions.length > 10) {
+    await sendInteractiveButtons(to, "Hay mas resultados disponibles.", [
+      { id: "ver_mas_resultados", title: "Ver mas resultados" },
+    ]);
+  }
 }
 
 function extractQuantity(text) {
@@ -790,12 +798,17 @@ async function finalizeProductSelectionWithQuantity(to, state, quantity) {
   const totals = buildCartTotalsText(state);
   const confirmationText = `${buildSelectionConfirmationText(cartItem, cartPreview)}\n\n${totals}`;
 
-  // Imagen incrustada como header del mensaje interactivo → imagen + texto + botones en UN SOLO mensaje
+  // Se envia imagen primero y luego confirmacion para priorizar orden visual en el chat.
   await sendPostCartActions(to, confirmationText, selected.imageUrl || null);
 }
 
-async function sendInteractiveList(to, bodyText, products) {
+async function sendInteractiveList(to, bodyText, products, offset = 0) {
   const rows = products.slice(0, 10).map((p, i) => buildCatalogRow(p, i));
+
+  const rowsWithOffset = rows.map((row, i) => ({
+    ...row,
+    id: `select_${offset + i + 1}`,
+  }));
 
   await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
     messaging_product: "whatsapp",
@@ -806,7 +819,7 @@ async function sendInteractiveList(to, bodyText, products) {
       body: { text: bodyText.substring(0, 1024) },
       action: {
         button: "Ver Catálogo",
-        sections: [{ title: "Productos disponibles", rows }]
+        sections: [{ title: "Productos disponibles", rows: rowsWithOffset }]
       }
     }
   }, {
@@ -864,7 +877,12 @@ async function sendProductsResponse(to, products, aiIntro, showWelcomeImage = fa
     if (showWelcomeImage && WELCOME_IMAGE_URL) {
       await sendImageMessage(to, WELCOME_IMAGE_URL, ROOSBOT_NAME).catch(() => {});
     }
-    await sendInteractiveList(to, aiIntro, products);
+    await sendInteractiveList(to, aiIntro, products.slice(0, 10), 0);
+    if (products.length > 10) {
+      await sendInteractiveButtons(to, "Hay mas resultados disponibles.", [
+        { id: "ver_mas_resultados", title: "Ver mas resultados" },
+      ]);
+    }
   } catch (err) {
     console.error("sendInteractiveList fallo:", JSON.stringify(err.response?.data ?? err.message, null, 2));
     // Fallback a texto plano
@@ -934,6 +952,30 @@ app.post("/webhook", async (req, res) => {
       if (buttonReplyId) {
         if (buttonReplyId === "ver_lista") {
           await sendTextMessage(from, handleListIntent(state));
+        } else if (buttonReplyId === "ver_mas_resultados") {
+          if (!state.lastOptions.length) {
+            await sendTextMessage(from, "No tengo mas resultados guardados. Escribe nuevamente el producto y te muestro opciones.");
+          } else {
+            const nextOffset = state.lastOptionsOffset + 10;
+            const page = state.lastOptions.slice(nextOffset, nextOffset + 10);
+            if (!page.length) {
+              await sendTextMessage(from, "Ya te mostre todos los resultados disponibles en esta busqueda.");
+            } else {
+              state.lastOptionsOffset = nextOffset;
+              await sendInteractiveList(
+                from,
+                `Mas resultados para tu busqueda (${nextOffset + 1}-${nextOffset + page.length} de ${state.lastOptions.length}):`,
+                page,
+                nextOffset
+              );
+
+              if (state.lastOptionsOffset + 10 < state.lastOptions.length) {
+                await sendInteractiveButtons(from, "Aun hay mas resultados.", [
+                  { id: "ver_mas_resultados", title: "Ver mas resultados" },
+                ]);
+              }
+            }
+          }
         } else if (buttonReplyId === "buscar_otro") {
           await sendTextMessage(from, "Claro, dime que producto necesitas.");
         } else if (buttonReplyId === "eliminar_ultimo") {
@@ -1012,6 +1054,7 @@ app.post("/webhook", async (req, res) => {
             console.log("Productos:", products.map((p) => p.name).join(" | "));
           }
           state.lastOptions = products.slice(0, MAX_OPTIONS);
+          state.lastOptionsOffset = 0;
           state.lastQuery = msgText;
 
           const shouldSendWelcome = !state.hasSentWelcome;
