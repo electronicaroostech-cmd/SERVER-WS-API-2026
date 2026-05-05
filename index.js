@@ -12,9 +12,9 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const WC_BASE_URL = process.env.WC_BASE_URL;
 const WC_CONSUMER_KEY = process.env.WC_CONSUMER_KEY;
 const WC_CONSUMER_SECRET = process.env.WC_CONSUMER_SECRET;
-const ROOSBOT_NAME = process.env.ROOSBOT_NAME || "ROOSbot";
+const ROOSBOT_NAME = process.env.ROOSBOT_NAME || "Roosbot";
 const WC_SEARCH_LIMIT = Number(process.env.WC_SEARCH_LIMIT || 8);
-const MAX_OPTIONS = Number(process.env.ROOSBOT_MAX_OPTIONS || 3);
+const MAX_OPTIONS = Math.max(5, Number(process.env.ROOSBOT_MAX_OPTIONS || 5));
 const WC_TIMEOUT_MS = Number(process.env.WC_TIMEOUT_MS || 6000);
 const SEARCH_CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS || 60000);
 const ENABLE_GEMINI_INTRO = process.env.ENABLE_GEMINI_INTRO === "true";
@@ -54,10 +54,10 @@ async function generateAiText(prompt) {
 async function generateAiIntroSafe(userMessage, products, isFirstTurn = false) {
   const esPrimerMensaje = Boolean(isFirstTurn);
   const fallbackIntro = esPrimerMensaje
-    ? "Soy ROOSbot, tu asistente de Roostech. Escribe el nombre del producto que necesitas."
+    ? "Soy Roosbot, tu asistente de Roostech. Escribe el nombre del producto que necesitas."
     : products.length
-      ? "Estas son las mejores opciones para ti, Elije una :"
-      : "No veo coincidencias exactas ahora mismo. intenta contra palabra similar o mas general.";
+      ? "Sí Encontramos estas opciones para ti, Elije una :"
+      : "No veo coincidencias exactas ahora mismo. intenta con otra palabra similar o mas general.";
 
   if (!ENABLE_GEMINI_INTRO) {
     return fallbackIntro;
@@ -410,7 +410,7 @@ function handleAddToCartIntent(userMessage, state) {
 
   const selected = resolveProductFromSelection(userMessage, state.lastOptions);
   if (!selected) {
-    return "Listo. Dime cual deseas agregar: 1, 2 o 3 segun la ultima recomendacion, o escribe el nombre del producto.";
+    return `Listo. Dime cual deseas agregar: 1 a ${MAX_OPTIONS} segun la ultima recomendacion, o escribe el nombre del producto.`;
   }
 
   state.cart.push({
@@ -551,9 +551,49 @@ function buildSelectionConfirmationText(selected, cartPreview) {
     "",
     "Así va tu lista:",
     cartPreview,
-    "",
-    "Escribe el nombre de otro producto o ver lista para ver todo.",
   ].join("\n");
+}
+
+function trimAtWord(value, maxLen) {
+  const text = String(value || "").trim();
+  if (text.length <= maxLen) {
+    return text;
+  }
+
+  const candidate = text.slice(0, maxLen);
+  const lastSpace = candidate.lastIndexOf(" ");
+  if (lastSpace > 8) {
+    return candidate.slice(0, lastSpace).trim();
+  }
+
+  return candidate.trim();
+}
+
+function buildCatalogRow(product, index) {
+  const fullName = (product.name || "Producto").replace(/\s+/g, " ").trim();
+  const title = trimAtWord(fullName, 24);
+  const remainingName = fullName.startsWith(title) ? fullName.slice(title.length).trim() : "";
+  const priceText = (product.price ? `$${product.price} ${product.currency || ""}`.trim() : "Ver mas");
+  const descriptionBase = remainingName ? `${remainingName} | ${priceText}` : priceText;
+
+  return {
+    id: `select_${index + 1}`,
+    title,
+    description: descriptionBase.substring(0, 72),
+  };
+}
+
+function buildCartPreview(state) {
+  return state.cart
+    .map((item, i) => `${i + 1}. ${item.name} x${item.quantity || 1} — $${item.price || "N/D"} ${item.currency || ""}`)
+    .join("\n");
+}
+
+async function sendPostCartActions(to) {
+  await sendInteractiveButtons(to, "Que deseas hacer ahora?", [
+    { id: "eliminar_ultimo", title: "Eliminar ultimo" },
+    { id: "finalizar_compra", title: "Finalizar compra" },
+  ]);
 }
 
 function extractQuantity(text) {
@@ -595,9 +635,7 @@ async function finalizeProductSelectionWithQuantity(to, state, quantity) {
   state.awaitingQuantity = false;
   state.pendingProduct = null;
 
-  const cartPreview = state.cart
-    .map((item, i) => `${i + 1}. ${item.name} x${item.quantity || 1} — $${item.price || "N/D"} ${item.currency || ""}`)
-    .join("\n");
+  const cartPreview = buildCartPreview(state);
   const confirmationText = buildSelectionConfirmationText(cartItem, cartPreview);
 
   if (selected.imageUrl) {
@@ -605,15 +643,12 @@ async function finalizeProductSelectionWithQuantity(to, state, quantity) {
   } else {
     await sendTextMessage(to, confirmationText);
   }
+
+  await sendPostCartActions(to);
 }
 
 async function sendInteractiveList(to, bodyText, products) {
-
-  const rows = products.slice(0, 10).map((p, i) => ({
-    id: `select_${i + 1}`,
-    title: p.name.substring(0, 24),
-    description: (p.price ? `$${p.price} ${p.currency || ""}`.trim() : "Ver más").substring(0, 72)
-  }));
+  const rows = products.slice(0, 10).map((p, i) => buildCatalogRow(p, i));
 
   await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
     messaging_product: "whatsapp",
@@ -677,7 +712,7 @@ async function sendProductsResponse(to, products, aiIntro, showWelcomeImage = fa
     const fallback = products.slice(0, MAX_OPTIONS)
       .map((p, i) => `${i + 1}. *${p.name}* — ${p.price ? `$${p.price}` : "N/D"} ${p.currency || ""}\n${p.url || ""}`)
       .join("\n\n");
-    await sendTextMessage(to, `${aiIntro}\n\n${fallback}\n\nEscribe *agregar 1*, *agregar 2* o *ver lista*.`);
+    await sendTextMessage(to, `${aiIntro}\n\n${fallback}\n\nEscribe *agregar 1* hasta *agregar ${MAX_OPTIONS}* o *ver lista*.`);
   }
 }
 
@@ -737,6 +772,31 @@ app.post("/webhook", async (req, res) => {
           await sendTextMessage(from, handleListIntent(state));
         } else if (buttonReplyId === "buscar_otro") {
           await sendTextMessage(from, "Claro, dime que producto necesitas.");
+        } else if (buttonReplyId === "eliminar_ultimo") {
+          if (!state.cart.length) {
+            await sendTextMessage(from, "Tu lista ya esta vacia. Dime que producto necesitas y te ayudo a elegir.");
+          } else {
+            const removed = state.cart.pop();
+            if (!state.cart.length) {
+              await sendTextMessage(from, `Elimine ${removed.name} de tu lista. Ahora no tienes productos agregados.`);
+            } else {
+              await sendTextMessage(
+                from,
+                `Elimine ${removed.name} de tu lista.\n\nEsta es tu lista actual:\n${buildCartPreview(state)}`
+              );
+              await sendPostCartActions(from);
+            }
+          }
+        } else if (buttonReplyId === "finalizar_compra") {
+          if (!state.cart.length) {
+            await sendTextMessage(from, "Aun no tienes productos en la lista. Elige uno del catalogo y te ayudo a finalizar.");
+          } else {
+            const resumen = buildCartPreview(state);
+            await sendTextMessage(
+              from,
+              `Perfecto, procedemos con tu compra.\n\nResumen de pedido:\n${resumen}\n\nComparte tu nombre y direccion para coordinar entrega y pago.`
+            );
+          }
         } else if (buttonReplyId === "qty_custom") {
           await sendTextMessage(from, "Perfecto. Escribe la cantidad que deseas (solo numero). Ejemplo: 4");
         } else if (buttonReplyId.startsWith("qty_")) {
