@@ -15,6 +15,7 @@ const WC_CONSUMER_SECRET = process.env.WC_CONSUMER_SECRET;
 const ROOSBOT_NAME = process.env.ROOSBOT_NAME || "Roosbot";
 const WC_SEARCH_LIMIT = Number(process.env.WC_SEARCH_LIMIT || 20);
 const MAX_OPTIONS = Math.max(20, Number(process.env.ROOSBOT_MAX_OPTIONS || 20));
+const ADVISOR_PHONE = String(process.env.ADVISOR_PHONE || "573052748292").replace(/\D/g, "");
 const WC_TIMEOUT_MS = Number(process.env.WC_TIMEOUT_MS || 6000);
 const SEARCH_CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS || 60000);
 const MESSAGE_DEDUP_TTL_MS = Number(process.env.MESSAGE_DEDUP_TTL_MS || 120000);
@@ -368,11 +369,34 @@ function initialUserState() {
     lastOptions: [],
     lastOptionsOffset: 0,
     cart: [],
+    checkoutStep: null,
+    checkoutData: null,
+    checkoutEditing: false,
     lastQuery: "",
     hasSentWelcome: false,
     awaitingQuantity: false,
     pendingProduct: null,
   };
+}
+
+function resetCheckoutState(state) {
+  state.checkoutStep = null;
+  state.checkoutData = null;
+  state.checkoutEditing = false;
+}
+
+function startCheckoutState(state) {
+  state.checkoutStep = "name";
+  state.checkoutEditing = false;
+  state.checkoutData = {
+    name: "",
+    document: "",
+    address: "",
+  };
+}
+
+function isCheckoutActive(state) {
+  return Boolean(state.checkoutStep && state.checkoutData);
 }
 
 function getUserState(phone) {
@@ -387,12 +411,16 @@ function extractSelectionIndex(text) {
     return null;
   }
 
-  const match = text.match(/\b([1-9])\b/);
+  const match = text.match(/\b(\d{1,2})\b/);
   if (!match) {
     return null;
   }
 
-  return Number(match[1]) - 1;
+  const index = Number(match[1]) - 1;
+  if (index < 0) {
+    return null;
+  }
+  return index;
 }
 
 function isAddIntent(text) {
@@ -709,12 +737,150 @@ function buildCartTotalsText(state) {
   return lines.length ? lines.join("\n") : "Total: N/D";
 }
 
+function buildCheckoutSummaryText(state) {
+  const data = state.checkoutData || {};
+  const cartLines = buildCartPreview(state);
+  const totals = buildCartTotalsText(state);
+
+  return [
+    "Resumen de tu pedido:",
+    "",
+    "Datos del cliente:",
+    `Nombre: ${data.name || "N/D"}`,
+    `Documento: ${data.document || "N/D"}`,
+    `Direccion: ${data.address || "N/D"}`,
+    "",
+    "Productos:",
+    cartLines,
+    "",
+    totals,
+  ].join("\n");
+}
+
+function buildAdvisorSummaryText(state, customerPhone) {
+  const data = state.checkoutData || {};
+  const cartLines = buildCartPreview(state);
+  const totals = buildCartTotalsText(state);
+
+  return [
+    "Nuevo pedido desde WhatsApp",
+    `Cliente WhatsApp: +${customerPhone}`,
+    `Nombre: ${data.name || "N/D"}`,
+    `Documento: ${data.document || "N/D"}`,
+    `Direccion: ${data.address || "N/D"}`,
+    "",
+    "Pedido:",
+    cartLines,
+    "",
+    totals,
+  ].join("\n");
+}
+
+function getCompatibleImageUrl(imageUrl) {
+  if (!imageUrl) {
+    return null;
+  }
+
+  const raw = String(imageUrl).trim();
+  if (!raw) {
+    return null;
+  }
+
+  const seemsWebp = /\.webp(?:$|\?)/i.test(raw);
+  if (!seemsWebp) {
+    return raw;
+  }
+
+  const withoutProtocol = raw.replace(/^https?:\/\//i, "");
+  return `https://images.weserv.nl/?url=${encodeURIComponent(withoutProtocol)}&output=jpg&q=82`;
+}
+
+async function sendCheckoutPreviewAndActions(to, state) {
+  const summary = buildCheckoutSummaryText(state);
+  await sendTextMessage(to, summary.slice(0, 3500));
+  await sendInteractiveButtons(to, "Revisa el resumen y elige una opcion:", [
+    { id: "confirmar_pedido", title: "Confirmar pedido" },
+    { id: "editar_datos", title: "Editar datos" },
+  ]);
+}
+
+async function sendPaymentOptions(to) {
+  const paymentText = [
+    "💰*Opciones de pago disponibles*",
+    "Puedes realizar tu pago a través de los siguientes medios:",
+    "",
+    "🏦*Bancolombia*",
+    "*Cuenta de ahorros*: 420-000060-80",
+    "",
+    "💳*Pasarela de pagos WOMPI*",
+    "",
+    "🏷️A nombre de:",
+    "*ROOSTECH SOLUCIONES TECNOLÓGICAS S.A.S*.",
+    "*NIT*: 902021788-7",
+    "",
+    "Cualquier duda, estamos aquí para ayudarte.",
+    "¡*Gracias nuevamente por tu preferencia*!"
+  ].join("\n");
+
+  await sendTextMessage(to, paymentText);
+}
+
+async function handleCheckoutTextFlow(from, state, msgText) {
+  if (!isCheckoutActive(state)) {
+    return false;
+  }
+
+  const value = String(msgText || "").trim();
+  if (!value) {
+    await sendTextMessage(from, "Necesito ese dato para continuar. Escribelo en un solo mensaje.");
+    return true;
+  }
+
+  if (state.checkoutStep === "name") {
+    state.checkoutData.name = value;
+    if (state.checkoutEditing) {
+      state.checkoutStep = "review";
+      state.checkoutEditing = false;
+      await sendCheckoutPreviewAndActions(from, state);
+    } else {
+      state.checkoutStep = "document";
+      await sendTextMessage(from, "Perfecto. Ahora comparte tu numero de documento.");
+    }
+    return true;
+  }
+
+  if (state.checkoutStep === "document") {
+    state.checkoutData.document = value;
+    if (state.checkoutEditing) {
+      state.checkoutStep = "review";
+      state.checkoutEditing = false;
+      await sendCheckoutPreviewAndActions(from, state);
+    } else {
+      state.checkoutStep = "address";
+      await sendTextMessage(from, "Excelente. Ahora escribe tu direccion de entrega.");
+    }
+    return true;
+  }
+
+  if (state.checkoutStep === "address") {
+    state.checkoutData.address = value;
+    state.checkoutStep = "review";
+    state.checkoutEditing = false;
+    await sendCheckoutPreviewAndActions(from, state);
+    return true;
+  }
+
+  if (state.checkoutStep === "review") {
+    await sendTextMessage(from, "Usa los botones para confirmar o editar tus datos.");
+    return true;
+  }
+
+  return false;
+}
+
 async function sendPostCartActions(to, bodyText = "Que deseas hacer ahora?", imageUrl = null) {
   const truncatedBody = bodyText.slice(0, 1024);
-  const seemsWebp = /\.webp(?:$|\?)/i.test(String(imageUrl || ""));
-  const imageToSendFirst = imageUrl && !seemsWebp
-    ? imageUrl
-    : (WELCOME_IMAGE_URL || null);
+  const imageToSendFirst = getCompatibleImageUrl(imageUrl) || WELCOME_IMAGE_URL || null;
 
   // Prioriza imagen separada para que aparezca primero en el chat.
   if (imageToSendFirst) {
@@ -952,6 +1118,63 @@ app.post("/webhook", async (req, res) => {
       if (buttonReplyId) {
         if (buttonReplyId === "ver_lista") {
           await sendTextMessage(from, handleListIntent(state));
+        } else if (buttonReplyId === "confirmar_pedido") {
+          if (!state.cart.length || !state.checkoutData) {
+            await sendTextMessage(from, "No tengo un pedido listo para confirmar. Agrega productos y vuelve a intentarlo.");
+          } else {
+            await sendPaymentOptions(from);
+            await sendInteractiveButtons(from, "Si deseas, envia tu pedido a un asesor para terminar la gestion.", [
+              { id: "enviar_asesor", title: "Enviar a asesor" },
+            ]);
+          }
+        } else if (buttonReplyId === "editar_datos") {
+          if (!state.checkoutData) {
+            await sendTextMessage(from, "No tengo datos cargados para editar. Presiona Finalizar compra nuevamente.");
+          } else {
+            await sendInteractiveButtons(from, "Que dato deseas editar?", [
+              { id: "editar_nombre", title: "Editar nombre" },
+              { id: "editar_documento", title: "Editar documento" },
+              { id: "editar_direccion", title: "Editar direccion" },
+            ]);
+          }
+        } else if (buttonReplyId === "editar_nombre") {
+          if (!state.checkoutData) {
+            await sendTextMessage(from, "No tengo datos cargados para editar. Presiona Finalizar compra nuevamente.");
+          } else {
+            state.checkoutStep = "name";
+            state.checkoutEditing = true;
+            await sendTextMessage(from, "Escribe tu nombre completo actualizado.");
+          }
+        } else if (buttonReplyId === "editar_documento") {
+          if (!state.checkoutData) {
+            await sendTextMessage(from, "No tengo datos cargados para editar. Presiona Finalizar compra nuevamente.");
+          } else {
+            state.checkoutStep = "document";
+            state.checkoutEditing = true;
+            await sendTextMessage(from, "Escribe tu numero de documento actualizado.");
+          }
+        } else if (buttonReplyId === "editar_direccion") {
+          if (!state.checkoutData) {
+            await sendTextMessage(from, "No tengo datos cargados para editar. Presiona Finalizar compra nuevamente.");
+          } else {
+            state.checkoutStep = "address";
+            state.checkoutEditing = true;
+            await sendTextMessage(from, "Escribe tu direccion actualizada.");
+          }
+        } else if (buttonReplyId === "enviar_asesor") {
+          if (!state.cart.length || !state.checkoutData) {
+            await sendTextMessage(from, "No encuentro informacion completa para enviar al asesor.");
+          } else {
+            const advisorSummary = buildAdvisorSummaryText(state, from);
+            try {
+              await sendTextMessage(ADVISOR_PHONE, advisorSummary.slice(0, 3500));
+              await sendTextMessage(from, "Listo. Ya envie tu pedido completo a un asesor. En breve te contactamos.");
+              resetCheckoutState(state);
+            } catch (advisorError) {
+              console.error("No se pudo enviar al asesor:", advisorError.response?.data || advisorError.message);
+              await sendTextMessage(from, "No pude enviar el pedido al asesor en este momento. Intenta nuevamente en un momento.");
+            }
+          }
         } else if (buttonReplyId === "ver_mas_resultados") {
           if (!state.lastOptions.length) {
             await sendTextMessage(from, "No tengo mas resultados guardados. Escribe nuevamente el producto y te muestro opciones.");
@@ -995,12 +1218,8 @@ app.post("/webhook", async (req, res) => {
           if (!state.cart.length) {
             await sendTextMessage(from, "Aun no tienes productos en la lista. Elige uno del catalogo y te ayudo a finalizar.");
           } else {
-            const resumen = buildCartPreview(state);
-            const totals = buildCartTotalsText(state);
-            await sendTextMessage(
-              from,
-              `Perfecto, procedemos con tu compra.\n\nResumen de pedido:\n${resumen}\n\n${totals}\n\nComparte tu nombre y direccion para coordinar entrega y pago.`
-            );
+            startCheckoutState(state);
+            await sendTextMessage(from, "Perfecto, vamos a finalizar tu compra paso a paso.\n\nPrimero, comparte tu nombre completo.");
           }
         } else if (buttonReplyId === "qty_custom") {
           await sendTextMessage(from, "Perfecto. Escribe la cantidad que deseas (solo numero). Ejemplo: 4");
@@ -1041,6 +1260,8 @@ app.post("/webhook", async (req, res) => {
         } else {
           await finalizeProductSelectionWithQuantity(from, state, qty);
         }
+      } else if (await handleCheckoutTextFlow(from, state, msgText)) {
+        // Checkout manejado
       } else {
         const addReply = handleAddToCartIntent(msgText, state);
         if (addReply) {
