@@ -709,10 +709,29 @@ function buildCartTotalsText(state) {
 }
 
 async function sendPostCartActions(to, bodyText = "Que deseas hacer ahora?", imageUrl = null) {
-  await sendInteractiveButtons(to, bodyText.slice(0, 1024), [
-    { id: "eliminar_ultimo", title: "Eliminar ultimo" },
-    { id: "finalizar_compra", title: "Finalizar compra" },
-  ], null, imageUrl);
+  const truncatedBody = bodyText.slice(0, 1024);
+  const seemsWebp = /\.webp(?:$|\?)/i.test(String(imageUrl || ""));
+  const safeImageUrl = seemsWebp ? null : imageUrl;
+
+  try {
+    await sendInteractiveButtons(to, truncatedBody, [
+      { id: "eliminar_ultimo", title: "Eliminar ultimo" },
+      { id: "finalizar_compra", title: "Finalizar compra" },
+    ], null, safeImageUrl);
+  } catch (errorWithImage) {
+    console.error("Fallo interactivo con imagen, reintentando sin imagen:", errorWithImage.response?.data || errorWithImage.message);
+
+    try {
+      await sendInteractiveButtons(to, truncatedBody, [
+        { id: "eliminar_ultimo", title: "Eliminar ultimo" },
+        { id: "finalizar_compra", title: "Finalizar compra" },
+      ]);
+    } catch (errorWithoutImage) {
+      console.error("Fallo interactivo sin imagen, usando texto plano:", errorWithoutImage.response?.data || errorWithoutImage.message);
+      await sendTextMessage(to, truncatedBody);
+    }
+  }
+
   await sendTextMessage(to, "O escribe el nombre de otro producto para seguir buscando.");
 }
 
