@@ -19,6 +19,8 @@ const ADVISOR_PHONE = String(process.env.ADVISOR_PHONE || "573052748292").replac
 const WC_TIMEOUT_MS = Number(process.env.WC_TIMEOUT_MS || 6000);
 const SEARCH_CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS || 60000);
 const MESSAGE_DEDUP_TTL_MS = Number(process.env.MESSAGE_DEDUP_TTL_MS || 120000);
+const INACTIVITY_REMINDER_MS = Number(process.env.INACTIVITY_REMINDER_MS || 600000);
+const INACTIVITY_TIMEOUT_MS = Number(process.env.INACTIVITY_TIMEOUT_MS || 1200000);
 const ENABLE_GEMINI_INTRO = process.env.ENABLE_GEMINI_INTRO === "true";
 const WELCOME_IMAGE_URL = process.env.WELCOME_IMAGE_URL || "https://roostech.co/wp-content/uploads/2026/05/rosboot.jpeg";
 
@@ -74,10 +76,11 @@ async function generateAiText(prompt) {
   throw lastError;
 }
 
-async function generateAiIntroSafe(userMessage, products, isFirstTurn = false) {
+async function generateAiIntroSafe(userMessage, products, isFirstTurn = false, clientName = "Cliente") {
   const esPrimerMensaje = Boolean(isFirstTurn);
+  const displayName = (clientName || "Cliente").split(" ")[0];
   const fallbackIntro = esPrimerMensaje
-    ? "Hola! Soy Roosbot, tu asistente de Roostech. Escribe el nombre del producto que necesitas."
+    ? `Hola! ${displayName} Soy Roosbot, tu asistente de Roostech. Escribe el nombre del producto que necesitas.`
     : products.length
       ? "Sí, Encontramos estas opciones para ti, Elije una :"
       : "No veo coincidencias exactas ahora mismo. intenta con otra palabra similar o mas general.";
@@ -376,6 +379,10 @@ function initialUserState() {
     hasSentWelcome: false,
     awaitingQuantity: false,
     pendingProduct: null,
+    clientName: "Cliente",
+    lastActivity: Date.now(),
+    reminderSent: false,
+    sessionClosed: false,
   };
 }
 
@@ -383,6 +390,11 @@ function resetCheckoutState(state) {
   state.checkoutStep = null;
   state.checkoutData = null;
   state.checkoutEditing = false;
+}
+
+function updateActivityTimestamp(state) {
+  state.lastActivity = Date.now();
+  state.reminderSent = false;
 }
 
 function startCheckoutState(state) {
@@ -825,6 +837,39 @@ async function sendPaymentOptions(to) {
   await sendTextMessage(to, paymentText);
 }
 
+async function sendInactivityReminder(to, state) {
+  if (state.reminderSent || state.sessionClosed) {
+    return;
+  }
+
+  const reminderText = [
+    "👋 *¿Aún sigues aquí?*",
+    "",
+    "Noté que no has respondido en los últimos 10 minutos.",
+    "Si tienes dudas sobre nuestros productos o tu pedido, estoy aquí para ayudarte.",
+    "",
+    "💬 Escribe algo cuando estes listo para continuar.",
+  ].join("\n");
+
+  await sendTextMessage(to, reminderText);
+  state.reminderSent = true;
+  console.log(`Recordatorio de inactividad enviado a: ${to}`);
+}
+
+async function sendSessionClosedMessage(to) {
+  const closureText = [
+    "⏱️ *Sesión cerrada por inactividad*",
+    "",
+    "No recibimos actividad de tu parte en los últimos 20 minutos, así que hemos cerrado tu sesión.",
+    "",
+    "Si deseas continuar comprando con nosotros, puedes escribir nuevamente y estaré aquí para ayudarte. 😊",
+    "",
+    "¡Que tengas un excelente día!",
+  ].join("\n");
+
+  await sendTextMessage(to, closureText);
+}
+
 async function handleCheckoutTextFlow(from, state, msgText) {
   if (!isCheckoutActive(state)) {
     return false;
@@ -1096,6 +1141,7 @@ app.post("/webhook", async (req, res) => {
   const entry = req.body.entry?.[0];
   const changes = entry?.changes?.[0];
   const message = changes?.value?.messages?.[0];
+  const contacts = changes?.value?.contacts?.[0];
 
   if (message) {
     if (isDuplicateInboundMessage(message.id)) {
@@ -1106,10 +1152,41 @@ app.post("/webhook", async (req, res) => {
     const from = message.from;
     const state = getUserState(from);
 
+    // Capturar nombre del cliente desde el perfil de WhatsApp
+    if (contacts?.profile?.name && state.clientName === "Cliente") {
+      state.clientName = contacts.profile.name;
+    }
+
+    // Verificar inactividad
+    const now = Date.now();
+    const inactivityTime = now - state.lastActivity;
+
+    if (state.hasSentWelcome && !state.sessionClosed && inactivityTime > INACTIVITY_TIMEOUT_MS) {
+      // Sesión cerrada por inactividad
+      await sendSessionClosedMessage(from);
+      state.sessionClosed = true;
+      updateActivityTimestamp(state);
+      return res.sendStatus(200);
+    }
+
+    // Si falta el recordatorio pero es tiempo, enviarlo
+    if (state.hasSentWelcome && !state.reminderSent && !state.sessionClosed && inactivityTime > INACTIVITY_REMINDER_MS) {
+      await sendInactivityReminder(from, state);
+    }
+
+    // Si es mensaje del usuario, actualizar timestamp y resetear recordatorio
+    updateActivityTimestamp(state);
+
     // Detectar si es clic de botón o selección de lista
     const buttonReplyId = message.interactive?.button_reply?.id
       || message.interactive?.list_reply?.id;
     const msgText = buttonReplyId || message.text?.body || "";
+
+    // Si la sesión estaba cerrada y el usuario vuelve a escribir, reabrir sesión
+    if (state.sessionClosed) {
+      state.sessionClosed = false;
+      state.reminderSent = false;
+    }
 
     console.log(`Mensaje de ${from}: ${msgText}`);
 
@@ -1123,8 +1200,8 @@ app.post("/webhook", async (req, res) => {
             await sendTextMessage(from, "No tengo un pedido listo para confirmar. Agrega productos y vuelve a intentarlo.");
           } else {
             await sendPaymentOptions(from);
-            await sendInteractiveButtons(from, "Si deseas, envia tu pedido a un asesor para terminar la gestion.", [
-              { id: "enviar_asesor", title: "Enviar a asesor" },
+            await sendInteractiveButtons(from, "Para completar tu pedido, envia tu captura a un asesor.", [
+              { id: "enviar_asesor", title: "Enviar a asesor y completar" },
             ]);
           }
         } else if (buttonReplyId === "editar_datos") {
@@ -1279,7 +1356,7 @@ app.post("/webhook", async (req, res) => {
           state.lastQuery = msgText;
 
           const shouldSendWelcome = !state.hasSentWelcome;
-          const aiIntro = await generateAiIntroSafe(msgText, products, shouldSendWelcome);
+          const aiIntro = await generateAiIntroSafe(msgText, products, shouldSendWelcome, state.clientName);
           await sendProductsResponse(from, state.lastOptions, aiIntro, shouldSendWelcome);
           if (shouldSendWelcome) {
             state.hasSentWelcome = true;
