@@ -52,9 +52,12 @@ async function generateAiText(prompt) {
 }
 
 async function generateAiIntroSafe(userMessage, products, cartSize = 0) {
-  const fallbackIntro = products.length
-    ? "Estas son las mejores opciones para ti:"
-    : "No veo coincidencias exactas ahora mismo.";
+  const esPrimerMensaje = cartSize === 0;
+  const fallbackIntro = esPrimerMensaje
+    ? "Soy ROOSbot, tu asistente de Roostech. Escribe el nombre del producto que necesitas."
+    : products.length
+      ? "Estas son las mejores opciones para ti:"
+      : "No veo coincidencias exactas ahora mismo.";
 
   if (!ENABLE_GEMINI_INTRO) {
     return fallbackIntro;
@@ -489,7 +492,7 @@ function buildRoosbotPrompt(userMessage, products, cartSize = 0) {
     ].join("\n");
 
     const reglaSaludo = esPrimerMensaje
-      ? "- Es el PRIMER mensaje del usuario: incluye un saludo breve y profesional al inicio de tu frase (ej: 'Hola, tenemos esto para ti:')."
+      ? `- Es el PRIMER mensaje del usuario: inicia con una frase tipo 'Soy ${ROOSBOT_NAME}, tu asistente de Roostech.' y luego guia al cliente de forma breve.`
       : "- NO incluyas saludos. El usuario ya conoce el bot. Ve directo al punto.";
 
   return [
@@ -508,7 +511,7 @@ function buildRoosbotPrompt(userMessage, products, cartSize = 0) {
     "",
     `Mensaje del cliente: ${userMessage}`,
     "",
-    "Escribe UNA sola frase de introduccion (ejemplo: 'Tenemos esto para ti:' o 'No tenemos ese exacto, pero mira estas opciones:'):",
+    `Escribe UNA sola frase de introduccion. Si es el primer mensaje, usa un tono como: 'Soy ${ROOSBOT_NAME}, tu asistente de Roostech. Escribe el nombre del producto que necesitas.'`,
   ].join("\n");
 }
 
@@ -674,7 +677,7 @@ app.post("/webhook", async (req, res) => {
             state.cart.push({ id: selected.id, name: selected.name, price: selected.price, currency: selected.currency, url: selected.url });
             const cartPreview = state.cart.map((item, i) => `${i + 1}. ${item.name} — $${item.price || "N/D"} ${item.currency || ""}`).join("\n");
             if (selected.imageUrl) {
-              await sendImageMessage(from, selected.imageUrl, selected.name).catch(() => {});
+              await sendImageMessage(from, selected.imageUrl, `Esta fue tu seleccion: ${selected.name}`.slice(0, 1024)).catch(() => {});
             }
             await sendTextMessage(from, `✅ *${selected.name}* apartado.\n\n*Tu lista:*\n${cartPreview}\n\nEscribe el nombre de otro producto o *ver lista* para ver todo.`);
           } else {
