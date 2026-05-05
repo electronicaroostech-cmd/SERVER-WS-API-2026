@@ -708,12 +708,12 @@ function buildCartTotalsText(state) {
   return lines.length ? lines.join("\n") : "Total: N/D";
 }
 
-async function sendPostCartActions(to, contextMessageId = null) {
-  const buttonsMessageId = await sendInteractiveButtons(to, "Que deseas hacer ahora?", [
+async function sendPostCartActions(to, bodyText = "Que deseas hacer ahora?") {
+  await sendInteractiveButtons(to, bodyText.slice(0, 1024), [
     { id: "eliminar_ultimo", title: "Eliminar ultimo" },
     { id: "finalizar_compra", title: "Finalizar compra" },
-  ], contextMessageId);
-  await sendTextMessage(to, "O escribe el nombre de otro producto para seguir buscando.", buttonsMessageId);
+  ]);
+  await sendTextMessage(to, "O escribe el nombre de otro producto para seguir buscando.");
 }
 
 async function sendOutOfStockRecommendation(to, state, selected) {
@@ -771,14 +771,13 @@ async function finalizeProductSelectionWithQuantity(to, state, quantity) {
   const totals = buildCartTotalsText(state);
   const confirmationText = `${buildSelectionConfirmationText(cartItem, cartPreview)}\n\n${totals}`;
 
-  let anchorMessageId = null;
+  // Imagen primero (se enviará con timestamp más temprano en WhatsApp)
   if (selected.imageUrl) {
-    anchorMessageId = await sendImageMessage(to, selected.imageUrl, confirmationText.slice(0, 1024));
-  } else {
-    anchorMessageId = await sendTextMessage(to, confirmationText);
+    await sendImageMessage(to, selected.imageUrl, selected.name.slice(0, 1024)).catch(() => {});
   }
 
-  await sendPostCartActions(to, anchorMessageId);
+  // Confirmación + botones en UN SOLO mensaje interactivo → orden garantizado entre ellos
+  await sendPostCartActions(to, confirmationText);
 }
 
 async function sendInteractiveList(to, bodyText, products) {
@@ -928,11 +927,8 @@ app.post("/webhook", async (req, res) => {
               await sendTextMessage(from, `Elimine ${removed.name} de tu lista. Ahora no tienes productos agregados.`);
             } else {
               const totals = buildCartTotalsText(state);
-              await sendTextMessage(
-                from,
-                `Elimine ${removed.name} de tu lista.\n\nEsta es tu lista actual:\n${buildCartPreview(state)}\n\n${totals}`
-              );
-              await sendPostCartActions(from);
+              const listText = `Elimine ${removed.name} de tu lista.\n\nEsta es tu lista actual:\n${buildCartPreview(state)}\n\n${totals}`;
+              await sendPostCartActions(from, listText);
             }
           }
         } else if (buttonReplyId === "finalizar_compra") {
