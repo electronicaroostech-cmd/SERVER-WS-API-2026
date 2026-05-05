@@ -337,6 +337,8 @@ function initialUserState() {
     cart: [],
     lastQuery: "",
     hasSentWelcome: false,
+    awaitingQuantity: false,
+    pendingProduct: null,
   };
 }
 
@@ -414,6 +416,7 @@ function handleAddToCartIntent(userMessage, state) {
   state.cart.push({
     id: selected.id,
     name: selected.name,
+    quantity: 1,
     price: selected.price,
     currency: selected.currency,
     url: selected.url,
@@ -421,7 +424,7 @@ function handleAddToCartIntent(userMessage, state) {
 
   const cartPreview = state.cart
     .slice(-3)
-    .map((item, index) => `${index + 1}. ${item.name} (${item.price || "N/D"} ${item.currency || ""})`)
+    .map((item, index) => `${index + 1}. ${item.name} x${item.quantity || 1} (${item.price || "N/D"} ${item.currency || ""})`)
     .join("\n");
 
   return [
@@ -451,7 +454,7 @@ function handleListIntent(state) {
   }
 
   const lines = state.cart
-    .map((item, index) => `${index + 1}. ${item.name} - ${item.price || "N/D"} ${item.currency || ""}`)
+    .map((item, index) => `${index + 1}. ${item.name} x${item.quantity || 1} - ${item.price || "N/D"} ${item.currency || ""}`)
     .join("\n");
 
   return [
@@ -544,13 +547,64 @@ function buildSelectionConfirmationText(selected, cartPreview) {
   return [
     `Esta fue tu seleccion: ${selected.name}`,
     "",
-    `✅ ${selected.name} apartado.`,
+    `✅ ${selected.name} x${selected.quantity || 1} apartado.`,
     "",
     "Así va tu lista:",
     cartPreview,
     "",
     "Escribe el nombre de otro producto o ver lista para ver todo.",
   ].join("\n");
+}
+
+function extractQuantity(text) {
+  if (!text) {
+    return null;
+  }
+
+  const match = String(text).match(/\b(\d{1,3})\b/);
+  if (!match) {
+    return null;
+  }
+
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value <= 0) {
+    return null;
+  }
+
+  return value;
+}
+
+async function finalizeProductSelectionWithQuantity(to, state, quantity) {
+  const selected = state.pendingProduct;
+  if (!selected) {
+    state.awaitingQuantity = false;
+    return sendTextMessage(to, "No encontre el producto pendiente. Elige uno de la lista nuevamente.");
+  }
+
+  const safeQty = Math.max(1, Math.min(999, Number(quantity) || 1));
+  const cartItem = {
+    id: selected.id,
+    name: selected.name,
+    quantity: safeQty,
+    price: selected.price,
+    currency: selected.currency,
+    url: selected.url,
+  };
+
+  state.cart.push(cartItem);
+  state.awaitingQuantity = false;
+  state.pendingProduct = null;
+
+  const cartPreview = state.cart
+    .map((item, i) => `${i + 1}. ${item.name} x${item.quantity || 1} — $${item.price || "N/D"} ${item.currency || ""}`)
+    .join("\n");
+  const confirmationText = buildSelectionConfirmationText(cartItem, cartPreview);
+
+  if (selected.imageUrl) {
+    await sendImageMessage(to, selected.imageUrl, confirmationText.slice(0, 1024));
+  } else {
+    await sendTextMessage(to, confirmationText);
+  }
 }
 
 async function sendInteractiveList(to, bodyText, products) {
@@ -683,18 +737,26 @@ app.post("/webhook", async (req, res) => {
           await sendTextMessage(from, handleListIntent(state));
         } else if (buttonReplyId === "buscar_otro") {
           await sendTextMessage(from, "Claro, dime que producto necesitas.");
+        } else if (buttonReplyId === "qty_custom") {
+          await sendTextMessage(from, "Perfecto. Escribe la cantidad que deseas (solo numero). Ejemplo: 4");
+        } else if (buttonReplyId.startsWith("qty_")) {
+          const quantity = Number(buttonReplyId.replace("qty_", ""));
+          if (!state.awaitingQuantity || !state.pendingProduct) {
+            await sendTextMessage(from, "No tengo un producto pendiente. Elige primero un producto del catalogo.");
+          } else {
+            await finalizeProductSelectionWithQuantity(from, state, quantity);
+          }
         } else if (buttonReplyId.startsWith("agregar_") || buttonReplyId.startsWith("select_")) {
           const index = Number(buttonReplyId.replace("agregar_", "").replace("select_", "")) - 1;
           const selected = state.lastOptions[index];
           if (selected) {
-            state.cart.push({ id: selected.id, name: selected.name, price: selected.price, currency: selected.currency, url: selected.url });
-            const cartPreview = state.cart.map((item, i) => `${i + 1}. ${item.name} — $${item.price || "N/D"} ${item.currency || ""}`).join("\n");
-            const confirmationText = buildSelectionConfirmationText(selected, cartPreview);
-            if (selected.imageUrl) {
-              await sendImageMessage(from, selected.imageUrl, confirmationText.slice(0, 1024));
-            } else {
-              await sendTextMessage(from, confirmationText);
-            }
+            state.pendingProduct = selected;
+            state.awaitingQuantity = true;
+            await sendInteractiveButtons(from, `Elegiste: ${selected.name}\n\nQue cantidad deseas?`, [
+              { id: "qty_1", title: "1 unidad" },
+              { id: "qty_2", title: "2 unidades" },
+              { id: "qty_custom", title: "Otra cantidad" },
+            ]);
           } else {
             await sendTextMessage(from, "No encontre esa opcion. Dime el producto que quieres y te lo busco.");
           }
@@ -703,25 +765,34 @@ app.post("/webhook", async (req, res) => {
       }
 
       // Flujo normal por texto
-      const addReply = handleAddToCartIntent(msgText, state);
-      if (addReply) {
-        await sendTextMessage(from, addReply);
-      } else if (isListIntent(msgText)) {
-        await sendTextMessage(from, handleListIntent(state));
-      } else {
-        const products = await fetchWooProducts(msgText);
-        console.log(`WooCommerce devolvio ${products.length} producto(s) para: "${msgText}"`);
-        if (products.length) {
-          console.log("Productos:", products.map((p) => p.name).join(" | "));
+      if (state.awaitingQuantity && state.pendingProduct) {
+        const qty = extractQuantity(msgText);
+        if (!qty) {
+          await sendTextMessage(from, "No entendi la cantidad. Escribe solo un numero, por ejemplo: 3");
+        } else {
+          await finalizeProductSelectionWithQuantity(from, state, qty);
         }
-        state.lastOptions = products.slice(0, MAX_OPTIONS);
-        state.lastQuery = msgText;
+      } else {
+        const addReply = handleAddToCartIntent(msgText, state);
+        if (addReply) {
+        await sendTextMessage(from, addReply);
+        } else if (isListIntent(msgText)) {
+          await sendTextMessage(from, handleListIntent(state));
+        } else {
+          const products = await fetchWooProducts(msgText);
+          console.log(`WooCommerce devolvio ${products.length} producto(s) para: "${msgText}"`);
+          if (products.length) {
+            console.log("Productos:", products.map((p) => p.name).join(" | "));
+          }
+          state.lastOptions = products.slice(0, MAX_OPTIONS);
+          state.lastQuery = msgText;
 
-        const shouldSendWelcome = !state.hasSentWelcome;
-        const aiIntro = await generateAiIntroSafe(msgText, products, shouldSendWelcome);
-        await sendProductsResponse(from, state.lastOptions, aiIntro, shouldSendWelcome);
-        if (shouldSendWelcome) {
-          state.hasSentWelcome = true;
+          const shouldSendWelcome = !state.hasSentWelcome;
+          const aiIntro = await generateAiIntroSafe(msgText, products, shouldSendWelcome);
+          await sendProductsResponse(from, state.lastOptions, aiIntro, shouldSendWelcome);
+          if (shouldSendWelcome) {
+            state.hasSentWelcome = true;
+          }
         }
       }
 
