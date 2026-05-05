@@ -80,10 +80,10 @@ async function generateAiIntroSafe(userMessage, products, isFirstTurn = false, c
   const esPrimerMensaje = Boolean(isFirstTurn);
   const displayName = (clientName || "Cliente").split(" ")[0];
   const fallbackIntro = esPrimerMensaje
-    ? `Hola! ${displayName} Soy Roosbot, tu asistente de Roostech. Escribe el nombre del producto que necesitas.`
+    ? `Hola! ${displayName}\n\n🤖 Soy Roosbot, tu asistente de Roostech.\n\nEscribe el nombre del producto que necesitas.`
     : products.length
-      ? "Sí, Encontramos estas opciones para ti, Elije una :"
-      : "No veo coincidencias exactas ahora mismo. intenta con otra palabra similar o mas general.";
+      ? "✨ Encontramos estas opciones para ti.\n\nElige una:"
+      : "🔎 No veo coincidencias exactas ahora mismo.\n\nIntenta con otra palabra similar o mas general.";
 
   if (!ENABLE_GEMINI_INTRO) {
     return fallbackIntro;
@@ -370,6 +370,7 @@ async function fetchWooProducts(userQuery) {
 function initialUserState() {
   return {
     lastOptions: [],
+    lastRelatedSuggestions: [],
     lastOptionsOffset: 0,
     cart: [],
     checkoutStep: null,
@@ -415,7 +416,138 @@ function getUserState(phone) {
   if (!userState.has(phone)) {
     userState.set(phone, initialUserState());
   }
+
   return userState.get(phone);
+}
+
+function buildLooseRelatedScore(product, keywords) {
+  const haystack = normalizeText([
+    product.name,
+    product.categories,
+    product.shortDescription,
+    product.sku,
+  ].filter(Boolean).join(" "));
+
+  if (!haystack || !keywords.length) {
+    return 0;
+  }
+
+  let score = 0;
+  for (const keyword of keywords) {
+    if (haystack.includes(keyword)) {
+      score += product.name && normalizeText(product.name).includes(keyword) ? 3 : 1;
+    }
+  }
+
+  if (isProductAvailable(product)) {
+    score += 2;
+  }
+
+  return score;
+}
+
+function buildRelatedSuggestions(candidates, rankedProducts, keywords) {
+  if (!candidates.length || !keywords.length) {
+    return [];
+  }
+
+  const rankedIds = new Set(rankedProducts.map((product) => product.id));
+
+  return candidates
+    .filter((product) => !rankedIds.has(product.id))
+    .map((product) => ({ product, score: buildLooseRelatedScore(product, keywords) }))
+    .filter(({ score }) => score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3)
+    .map(({ product }) => product);
+}
+
+async function fetchWooProductsResult(userQuery) {
+  if (!hasWooCredentials()) {
+    console.error("WooCommerce no configurado: faltan WC_BASE_URL, WC_CONSUMER_KEY o WC_CONSUMER_SECRET");
+    return { products: [], relatedSuggestions: [] };
+  }
+
+  const cleanedPhrase = cleanSearchQuery(userQuery);
+
+  if (!cleanedPhrase) {
+    console.log("Query limpio vacio, sin busqueda.");
+    return { products: [], relatedSuggestions: [] };
+  }
+
+  const cached = getCachedSearch(cleanedPhrase);
+  if (cached) {
+    console.log(`Cache hit para: "${cleanedPhrase}"`);
+    if (Array.isArray(cached)) {
+      return { products: cached, relatedSuggestions: [] };
+    }
+    return cached;
+  }
+
+  const keywords = cleanedPhrase.split(" ").filter((w) => w.length >= 2);
+  console.log(`Query limpio: "${cleanedPhrase}" | Keywords: [${keywords.join(", ")}]`);
+
+  try {
+    const baseUrl = WC_BASE_URL.replace(/\/$/, "");
+    const searchTerms = buildSearchTerms(cleanedPhrase, keywords);
+    const candidateMap = new Map();
+
+    const responses = await Promise.allSettled(
+      searchTerms.map((term) => queryWooProducts(baseUrl, term, 30))
+    );
+
+    for (const resp of responses) {
+      if (resp.status !== "fulfilled") {
+        continue;
+      }
+      for (const product of resp.value) {
+        candidateMap.set(product.id, product);
+      }
+    }
+
+    const candidates = [...candidateMap.values()];
+    console.log(`WooCommerce devolvio ${candidates.length} candidatos unicos para: "${cleanedPhrase}"`);
+
+    const scored = candidates
+      .map((p) => ({ product: p, score: scoreProduct(p, cleanedPhrase, keywords) }))
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => {
+        const availabilityDiff = Number(isProductAvailable(b.product)) - Number(isProductAvailable(a.product));
+        if (availabilityDiff !== 0) {
+          return availabilityDiff;
+        }
+        return b.score - a.score;
+      });
+
+    if (!scored.length) {
+      console.log("Scoring: ningun producto supero 0 puntos.");
+      return { products: [], relatedSuggestions: [] };
+    }
+
+    console.log(
+      `Top scoring: ${scored
+        .slice(0, 5)
+        .map((s) => `${s.product.name}(${s.score}pts)`)
+        .join(" | ")}`
+    );
+
+    const ranked = scored.slice(0, MAX_OPTIONS).map((s) => s.product);
+    const relatedSuggestions = ranked.length <= 3
+      ? buildRelatedSuggestions(candidates, ranked, keywords)
+      : [];
+
+    const result = { products: ranked, relatedSuggestions };
+    setCachedSearch(cleanedPhrase, result);
+    return result;
+  } catch (error) {
+    console.error("Error consultando WooCommerce:", error.response?.status, error.response?.data || error.message);
+    return { products: [], relatedSuggestions: [] };
+  }
+}
+
+async function fetchWooProducts(userQuery) {
+  const result = await fetchWooProductsResult(userQuery);
+  return result.products;
 }
 
 function extractSelectionIndex(text) {
@@ -432,6 +564,7 @@ function extractSelectionIndex(text) {
   if (index < 0) {
     return null;
   }
+
   return index;
 }
 
@@ -478,20 +611,20 @@ function handleAddToCartIntent(userMessage, state) {
   }
 
   if (!state.lastOptions.length) {
-    return "Perfecto, te ayudo con eso. Primero dime que producto quieres y te paso opciones para agregar.";
+    return "🛍️ Perfecto, te ayudo con eso.\n\nPrimero dime que producto quieres y te paso opciones para agregar.";
   }
 
   const selected = resolveProductFromSelection(userMessage, state.lastOptions);
   if (!selected) {
-    return `Listo. Dime cual deseas agregar: 1 a ${MAX_OPTIONS} segun la ultima recomendacion, o escribe el nombre del producto.`;
+    return `🛒 Listo.\n\nDime cual deseas agregar: 1 a ${MAX_OPTIONS} segun la ultima recomendacion, o escribe el nombre del producto.`;
   }
 
   if (!isProductAvailable(selected)) {
     const alternatives = state.lastOptions.filter((product) => product.id !== selected.id && isProductAvailable(product));
     const alternativesText = alternatives.length
-      ? ` Te recomiendo: ${alternatives.slice(0, 3).map((product) => product.name).join(", ")}.`
-      : " Ahora mismo no veo otra opcion disponible en esta busqueda.";
-    return `${selected.name} no tiene stock disponible.${alternativesText}`;
+      ? `\n\n✨ Te recomiendo: ${alternatives.slice(0, 3).map((product) => product.name).join(", ")}.`
+      : "\n\nPor ahora no veo otra opcion disponible en esta busqueda.";
+    return `⚠️ ${selected.name} no tiene stock disponible.${alternativesText}`;
   }
 
   state.cart.push({
@@ -509,9 +642,11 @@ function handleAddToCartIntent(userMessage, state) {
     .join("\n");
 
   return [
-    `Listo, agregue ${selected.name} a tu lista.`,
-    "Tu lista actual:",
+    `✅ Listo, agregue ${selected.name} a tu lista.`,
+    "",
+    "🛒 Tu lista actual:",
     cartPreview,
+    "",
     "Si quieres, te ayudo a agregar otro o te paso el enlace directo para comprar.",
   ].join("\n");
 }
@@ -531,17 +666,18 @@ function isListIntent(text) {
 
 function handleListIntent(state) {
   if (!state.cart.length) {
-    return "Aun no tienes productos agregados. Si quieres, te recomiendo opciones segun tu proyecto.";
+    return "🛒 Aun no tienes productos agregados.\n\nSi quieres, te recomiendo opciones segun tu proyecto.";
   }
 
   const lines = buildCartPreview(state);
   const totals = buildCartTotalsText(state);
 
   return [
-    "Esta es tu lista actual:",
+    "🛒 Esta es tu lista actual:",
     lines,
     "",
     totals,
+    "",
     "Si deseas, te ayudo a agregar otro producto.",
   ].join("\n");
 }
@@ -1076,7 +1212,23 @@ async function sendInteractiveButtons(to, bodyText, buttons, contextMessageId = 
   return response.data?.messages?.[0]?.id || null;
 }
 
-async function sendProductsResponse(to, products, aiIntro, showWelcomeImage = false) {
+function buildRelatedSuggestionsText(relatedSuggestions) {
+  if (!relatedSuggestions.length) {
+    return "";
+  }
+
+  const lines = relatedSuggestions
+    .slice(0, 3)
+    .map((product) => `• ${product.name}${product.price ? ` - $${product.price} ${product.currency || ""}`.trimEnd() : ""}`);
+
+  return [
+    "✨ Tambien te pueden servir estas opciones relacionadas:",
+    "",
+    ...lines,
+  ].join("\n");
+}
+
+async function sendProductsResponse(to, products, aiIntro, showWelcomeImage = false, relatedSuggestions = []) {
   if (!products.length) {
     if (showWelcomeImage && WELCOME_IMAGE_URL) {
       await sendImageMessage(to, WELCOME_IMAGE_URL, ROOSBOT_NAME).catch(() => {});
@@ -1089,8 +1241,11 @@ async function sendProductsResponse(to, products, aiIntro, showWelcomeImage = fa
       await sendImageMessage(to, WELCOME_IMAGE_URL, ROOSBOT_NAME).catch(() => {});
     }
     await sendInteractiveList(to, aiIntro, products.slice(0, 10), 0);
+    if (products.length <= 3 && relatedSuggestions.length) {
+      await sendTextMessage(to, buildRelatedSuggestionsText(relatedSuggestions));
+    }
     if (products.length > 10) {
-      await sendInteractiveButtons(to, "Hay mas resultados disponibles.", [
+      await sendInteractiveButtons(to, "📦 Hay mas resultados disponibles.", [
         { id: "ver_mas_resultados", title: "Ver mas resultados" },
       ]);
     }
@@ -1100,7 +1255,10 @@ async function sendProductsResponse(to, products, aiIntro, showWelcomeImage = fa
     const fallback = products.slice(0, MAX_OPTIONS)
       .map((p, i) => `${i + 1}. *${p.name}* — ${p.price ? `$${p.price}` : "N/D"} ${p.currency || ""}\n${p.url || ""}`)
       .join("\n\n");
-    await sendTextMessage(to, `${aiIntro}\n\n${fallback}\n\nEscribe *agregar 1* hasta *agregar ${MAX_OPTIONS}* o *ver lista*.`);
+    const relatedText = products.length <= 3 && relatedSuggestions.length
+      ? `\n\n${buildRelatedSuggestionsText(relatedSuggestions)}`
+      : "";
+    await sendTextMessage(to, `${aiIntro}\n\n${fallback}${relatedText}\n\n🛒 Escribe *agregar 1* hasta *agregar ${MAX_OPTIONS}* o *ver lista*.`);
   }
 }
 
@@ -1201,7 +1359,7 @@ app.post("/webhook", async (req, res) => {
           } else {
             await sendPaymentOptions(from);
             await sendInteractiveButtons(from, "Para completar tu pedido, envia tu captura a un asesor.", [
-              { id: "enviar_asesor", title: "Enviar a asesor y completar" },
+              { id: "enviar_asesor", title: "Enviar a asesor" },
             ]);
           }
         } else if (buttonReplyId === "editar_datos") {
@@ -1346,18 +1504,20 @@ app.post("/webhook", async (req, res) => {
         } else if (isListIntent(msgText)) {
           await sendTextMessage(from, handleListIntent(state));
         } else {
-          const products = await fetchWooProducts(msgText);
+          const searchResult = await fetchWooProductsResult(msgText);
+          const products = searchResult.products;
           console.log(`WooCommerce devolvio ${products.length} producto(s) para: "${msgText}"`);
           if (products.length) {
             console.log("Productos:", products.map((p) => p.name).join(" | "));
           }
           state.lastOptions = products.slice(0, MAX_OPTIONS);
+          state.lastRelatedSuggestions = searchResult.relatedSuggestions || [];
           state.lastOptionsOffset = 0;
           state.lastQuery = msgText;
 
           const shouldSendWelcome = !state.hasSentWelcome;
           const aiIntro = await generateAiIntroSafe(msgText, products, shouldSendWelcome, state.clientName);
-          await sendProductsResponse(from, state.lastOptions, aiIntro, shouldSendWelcome);
+          await sendProductsResponse(from, state.lastOptions, aiIntro, shouldSendWelcome, state.lastRelatedSuggestions);
           if (shouldSendWelcome) {
             state.hasSentWelcome = true;
           }
