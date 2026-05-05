@@ -56,8 +56,8 @@ async function generateAiIntroSafe(userMessage, products, cartSize = 0) {
   const fallbackIntro = esPrimerMensaje
     ? "Soy ROOSbot, tu asistente de Roostech. Escribe el nombre del producto que necesitas."
     : products.length
-      ? "Estas son las mejores opciones para ti:"
-      : "No veo coincidencias exactas ahora mismo.";
+      ? "Estas son las mejores opciones para ti, Elije una :"
+      : "No veo coincidencias exactas ahora mismo. intenta contra palabra similar o mas general.";
 
   if (!ENABLE_GEMINI_INTRO) {
     return fallbackIntro;
@@ -540,6 +540,19 @@ async function sendImageMessage(to, imageUrl, caption = "") {
   });
 }
 
+function buildSelectionConfirmationText(selected, cartPreview) {
+  return [
+    `Esta fue tu seleccion: ${selected.name}`,
+    "",
+    `✅ ${selected.name} apartado.`,
+    "",
+    "Así va tu lista:",
+    cartPreview,
+    "",
+    "Escribe el nombre de otro producto o ver lista para ver todo.",
+  ].join("\n");
+}
+
 async function sendInteractiveList(to, bodyText, products) {
 
   const rows = products.slice(0, 10).map((p, i) => ({
@@ -676,10 +689,12 @@ app.post("/webhook", async (req, res) => {
           if (selected) {
             state.cart.push({ id: selected.id, name: selected.name, price: selected.price, currency: selected.currency, url: selected.url });
             const cartPreview = state.cart.map((item, i) => `${i + 1}. ${item.name} — $${item.price || "N/D"} ${item.currency || ""}`).join("\n");
+            const confirmationText = buildSelectionConfirmationText(selected, cartPreview);
             if (selected.imageUrl) {
-              await sendImageMessage(from, selected.imageUrl, `Esta fue tu seleccion: ${selected.name}`.slice(0, 1024)).catch(() => {});
+              await sendImageMessage(from, selected.imageUrl, confirmationText.slice(0, 1024));
+            } else {
+              await sendTextMessage(from, confirmationText);
             }
-            await sendTextMessage(from, `✅ *${selected.name}* apartado.\n\n*Tu lista:*\n${cartPreview}\n\nEscribe el nombre de otro producto o *ver lista* para ver todo.`);
           } else {
             await sendTextMessage(from, "No encontre esa opcion. Dime el producto que quieres y te lo busco.");
           }
