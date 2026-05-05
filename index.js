@@ -453,13 +453,14 @@ function handleListIntent(state) {
     return "Aun no tienes productos agregados. Si quieres, te recomiendo opciones segun tu proyecto.";
   }
 
-  const lines = state.cart
-    .map((item, index) => `${index + 1}. ${item.name} x${item.quantity || 1} - ${item.price || "N/D"} ${item.currency || ""}`)
-    .join("\n");
+  const lines = buildCartPreview(state);
+  const totals = buildCartTotalsText(state);
 
   return [
     "Esta es tu lista actual:",
     lines,
+    "",
+    totals,
     "Si deseas, te ayudo a agregar otro producto.",
   ].join("\n");
 }
@@ -547,11 +548,43 @@ function buildSelectionConfirmationText(selected, cartPreview) {
   return [
     `Esta fue tu seleccion: ${selected.name}`,
     "",
-    `✅ ${selected.name} x${selected.quantity || 1} apartado.`,
+    `✅ ${selected.name} x${selected.quantity || 1} agregado!.`,
     "",
-    "Así va tu lista:",
+    "Así va tu lista!:",
     cartPreview,
   ].join("\n");
+}
+
+function parsePriceNumber(value) {
+  if (value === null || value === undefined || value === "") {
+    return 0;
+  }
+
+  let raw = String(value).trim().replace(/[^\d,.-]/g, "");
+  if (!raw) {
+    return 0;
+  }
+
+  const commaPos = raw.lastIndexOf(",");
+  const dotPos = raw.lastIndexOf(".");
+
+  if (commaPos !== -1 && dotPos !== -1) {
+    if (commaPos > dotPos) {
+      raw = raw.replace(/\./g, "").replace(",", ".");
+    } else {
+      raw = raw.replace(/,/g, "");
+    }
+  } else if (commaPos !== -1) {
+    raw = raw.replace(",", ".");
+  }
+
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function formatMoney(value) {
+  const amount = Number(value) || 0;
+  return amount.toFixed(2).replace(/\.00$/, "");
 }
 
 function trimAtWord(value, maxLen) {
@@ -585,8 +618,34 @@ function buildCatalogRow(product, index) {
 
 function buildCartPreview(state) {
   return state.cart
-    .map((item, i) => `${i + 1}. ${item.name} x${item.quantity || 1} — $${item.price || "N/D"} ${item.currency || ""}`)
+    .map((item, i) => {
+      const qty = item.quantity || 1;
+      const unitPrice = parsePriceNumber(item.price);
+      const subtotal = unitPrice * qty;
+      const currency = item.currency || "";
+      const subtotalText = unitPrice > 0 ? ` | Subtotal: $${formatMoney(subtotal)} ${currency}` : "";
+      return `${i + 1}. ${item.name} x${qty} — $${item.price || "N/D"} ${currency}${subtotalText}`;
+    })
     .join("\n");
+}
+
+function buildCartTotalsText(state) {
+  const totalsByCurrency = new Map();
+
+  for (const item of state.cart) {
+    const qty = item.quantity || 1;
+    const unitPrice = parsePriceNumber(item.price);
+    const subtotal = unitPrice * qty;
+    const currency = item.currency || "";
+    const current = totalsByCurrency.get(currency) || 0;
+    totalsByCurrency.set(currency, current + subtotal);
+  }
+
+  const lines = [...totalsByCurrency.entries()]
+    .filter(([, total]) => total > 0)
+    .map(([currency, total]) => `Total: $${formatMoney(total)} ${currency}`.trim());
+
+  return lines.length ? lines.join("\n") : "Total: N/D";
 }
 
 async function sendPostCartActions(to) {
@@ -594,6 +653,7 @@ async function sendPostCartActions(to) {
     { id: "eliminar_ultimo", title: "Eliminar ultimo" },
     { id: "finalizar_compra", title: "Finalizar compra" },
   ]);
+  await sendTextMessage(to, "O escribe el nombre de otro producto para seguir buscando.");
 }
 
 function extractQuantity(text) {
@@ -636,7 +696,8 @@ async function finalizeProductSelectionWithQuantity(to, state, quantity) {
   state.pendingProduct = null;
 
   const cartPreview = buildCartPreview(state);
-  const confirmationText = buildSelectionConfirmationText(cartItem, cartPreview);
+  const totals = buildCartTotalsText(state);
+  const confirmationText = `${buildSelectionConfirmationText(cartItem, cartPreview)}\n\n${totals}`;
 
   if (selected.imageUrl) {
     await sendImageMessage(to, selected.imageUrl, confirmationText.slice(0, 1024));
@@ -780,9 +841,10 @@ app.post("/webhook", async (req, res) => {
             if (!state.cart.length) {
               await sendTextMessage(from, `Elimine ${removed.name} de tu lista. Ahora no tienes productos agregados.`);
             } else {
+              const totals = buildCartTotalsText(state);
               await sendTextMessage(
                 from,
-                `Elimine ${removed.name} de tu lista.\n\nEsta es tu lista actual:\n${buildCartPreview(state)}`
+                `Elimine ${removed.name} de tu lista.\n\nEsta es tu lista actual:\n${buildCartPreview(state)}\n\n${totals}`
               );
               await sendPostCartActions(from);
             }
@@ -792,9 +854,10 @@ app.post("/webhook", async (req, res) => {
             await sendTextMessage(from, "Aun no tienes productos en la lista. Elige uno del catalogo y te ayudo a finalizar.");
           } else {
             const resumen = buildCartPreview(state);
+            const totals = buildCartTotalsText(state);
             await sendTextMessage(
               from,
-              `Perfecto, procedemos con tu compra.\n\nResumen de pedido:\n${resumen}\n\nComparte tu nombre y direccion para coordinar entrega y pago.`
+              `Perfecto, procedemos con tu compra.\n\nResumen de pedido:\n${resumen}\n\n${totals}\n\nComparte tu nombre y direccion para coordinar entrega y pago.`
             );
           }
         } else if (buttonReplyId === "qty_custom") {
